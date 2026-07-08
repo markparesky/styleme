@@ -625,6 +625,14 @@ function renderDrafts() {
     }
     renderDrafts();
   }));
+  box.querySelectorAll('[data-d-more]').forEach(b => b.addEventListener('click', () => {
+    const d = S.drafts.find(x => x.id === b.dataset.dMore);
+    const current = d.options[d.colorIdx];
+    d.manualColor = true;
+    d.options = NAMED_COLORS;
+    d.colorIdx = Math.max(0, NAMED_COLORS.findIndex(c => c.name === current.name));
+    renderDrafts();
+  }));
   box.querySelectorAll('[data-d-colorsel]').forEach(sel => sel.addEventListener('change', () => {
     const d = S.drafts.find(x => x.id === sel.dataset.dColorsel);
     d.colorIdx = +sel.value;
@@ -691,8 +699,9 @@ function draftRowHtml(d) {
     : notes.length ? `<span class="qnote">${notes.join(' · ')}</span>` :
     `<span class="qnote warn">Shot on a busy background — color read from the center. A white surface reads truer.</span>`;
   const colorPicker = d.manualColor
-    ? `<select class="input" data-d-colorsel="${d.id}" aria-label="Color">${d.options.map((o, i) => `<option value="${i}" ${i === d.colorIdx ? 'selected' : ''}>${o.name}</option>`).join('')}</select>`
-    : d.options.map((o, i) => `<button class="sw-opt ${i === d.colorIdx ? 'sel' : ''}" data-d-id="${d.id}" data-d-color="${i}"><span class="swatch" style="background:${o.hex}"></span>${esc(o.name)}${i === d.colorIdx ? ' ✓' : ''}</button>`).join('');
+    ? `<span class="swatch" style="background:${d.options[d.colorIdx].hex};width:26px;height:26px"></span><select class="input" data-d-colorsel="${d.id}" aria-label="Color">${d.options.map((o, i) => `<option value="${i}" ${i === d.colorIdx ? 'selected' : ''}>${o.name}</option>`).join('')}</select>`
+    : d.options.map((o, i) => `<button class="sw-opt ${i === d.colorIdx ? 'sel' : ''}" data-d-id="${d.id}" data-d-color="${i}"><span class="swatch" style="background:${o.hex}"></span>${esc(o.name)}${i === d.colorIdx ? ' ✓' : ''}</button>`).join('') +
+      `<button class="sw-opt" data-d-more="${d.id}" title="Pick from all colors">More colors…</button>`;
   return `
     <div class="review-row">
       <div class="review-thumb"><img src="${d.img}" alt=""></div>
