@@ -293,10 +293,13 @@ function viewAdd() {
       </div>
       <p class="muted" id="bc-status" style="font-size:13px;margin-top:10px"></p>
     </div>
-    <div class="divider">or add by image URL</div>
-    <div style="display:flex;gap:10px;flex-wrap:wrap;max-width:640px">
-      <input class="input" id="url-in" placeholder="https://… direct image link" style="flex:1;min-width:220px">
-      <button class="btn line" id="url-go">Use link</button>
+    <div class="divider">or add by link — or just type the item's name</div>
+    <div style="max-width:640px">
+      <div style="display:flex;gap:10px;flex-wrap:wrap">
+        <input class="input" id="url-in" placeholder="Paste a product link, or type a name (e.g. lululemon Metal Vent Tech shirt)" style="flex:1;min-width:220px">
+        <button class="btn line" id="url-go">Find it</button>
+      </div>
+      <p class="muted" style="font-size:12.5px;margin-top:8px">Names work even for brands that block links — you'll pick the right photo from search results.</p>
     </div>
     <div id="draft-list" style="margin-top:34px"></div>`;
 
@@ -457,6 +460,57 @@ async function fetchImageBlob(url) {
   return null;
 }
 
+// Type a name ("lululemon Metal Vent Tech shirt") → image search → pick the photo
+async function handleNameSearch(query) {
+  toast(`Searching for "${query}"…`);
+  let results = null;
+  try {
+    const res = await fetch('/api/search?q=' + encodeURIComponent(query));
+    const j = await res.json();
+    if (!res.ok) { toast(j.error || 'Search failed.'); return; }
+    results = j.results;
+  } catch {
+    toast('Search needs the hosted app — it isn’t available on this local copy.');
+    return;
+  }
+  $modal.innerHTML = `
+    <div class="modal-back" id="isback">
+      <div class="modal" style="max-width:680px">
+        <h2>Pick your item</h2>
+        <p class="muted" style="margin:6px 0 14px">Best photo wins — a studio shot on a plain background gives the truest color.</p>
+        <div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(140px,1fr));gap:10px;max-height:56vh;overflow-y:auto">
+          ${results.map((r, i) => `
+            <button data-is-pick="${i}" style="border:1.5px solid var(--line);border-radius:12px;overflow:hidden;background:#fff;display:flex;flex-direction:column;padding:0">
+              <img src="${esc(r.thumbnail)}" alt="" style="width:100%;height:130px;object-fit:cover" loading="lazy">
+              <span style="font-size:10.5px;color:var(--stone);padding:6px 8px;text-align:left;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:100%">${esc((r.title || '').slice(0, 60))}</span>
+            </button>`).join('')}
+        </div>
+        <div style="margin-top:16px"><button class="btn quiet" id="is-cancel">Cancel</button></div>
+      </div>
+    </div>`;
+  const close = () => { $modal.innerHTML = ''; };
+  document.getElementById('isback').addEventListener('click', e => { if (e.target.id === 'isback') close(); });
+  document.getElementById('is-cancel').addEventListener('click', close);
+  document.querySelectorAll('[data-is-pick]').forEach(b => b.addEventListener('click', async () => {
+    const r = results[+b.dataset.isPick];
+    close();
+    toast('Reading the photo…');
+    let blob = await fetchImageBlob(r.image);
+    if (!blob) blob = await fetchImageBlob(r.thumbnail);
+    if (!blob) { toast('That photo can’t be read — try another result.'); await handleNameSearch(query); return; }
+    const dataUrl = await new Promise((ok, no) => { const fr = new FileReader(); fr.onload = () => ok(fr.result); fr.onerror = no; fr.readAsDataURL(blob); });
+    try {
+      const a = await analyzeImage(dataUrl);
+      addDraft(a);
+      const d = S.drafts[S.drafts.length - 1];
+      d.name = query;
+      renderDrafts();
+      document.getElementById('url-in').value = '';
+      toast('Added — confirm the color and size below.');
+    } catch { toast('Could not read that image — try another result.'); }
+  }));
+}
+
 // Product PAGE → { image, title, color } via the server-side scraper
 async function scrapeProductPage(url) {
   try {
@@ -469,6 +523,7 @@ async function scrapeProductPage(url) {
 async function handleUrl() {
   const url = document.getElementById('url-in').value.trim();
   if (!url) return;
+  if (!/^https?:\/\//i.test(url)) { await handleNameSearch(url); return; }
   toast('Fetching…');
   let blob = await fetchImageBlob(url);
   let scraped = null;
