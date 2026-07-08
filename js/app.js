@@ -482,8 +482,11 @@ async function handleUrl() {
     try {
       const a = await analyzeImage(dataUrl);
       document.getElementById('url-in').value = '';
-      if (scraped && scraped.colors && scraped.colors.length > 1) {
-        // The product comes in several colorways — ask which ones Mark owns
+      const manyColors = scraped && scraped.colors && scraped.colors.length > 1;
+      const manySizes = scraped && scraped.sizes && scraped.sizes.length > 1;
+      if (manyColors || manySizes) {
+        // Ask which colorways Mark owns and what size he takes
+        if (!scraped.colors || !scraped.colors.length) scraped.colors = [scraped.color || 'As shown'];
         openColorwayModal(scraped, a);
         return;
       }
@@ -530,17 +533,16 @@ async function handleUrl() {
   toast('Image added — this site hides its colors from us, so pick the color below.');
 }
 
-// A retailer-declared color name ("Heather Navy") outranks the pixel guess
+// A retailer-declared color name ("Heather Navy") outranks the pixel guess,
+// and is kept verbatim as the brand color — the rebuy reference.
 function applyDeclaredColor(d, declaredName) {
   if (!declaredName) return;
+  d.brandColor = declaredName;
   const named = NAMED_COLORS.find(c =>
     declaredName.toLowerCase().includes(c.name.toLowerCase()) || c.name.toLowerCase() === declaredName.toLowerCase());
   if (named) {
     if (!d.options.some(o => o.name === named.name)) d.options = [named, ...d.options].slice(0, 3);
     d.colorIdx = d.options.findIndex(o => o.name === named.name);
-  } else {
-    // unknown label — keep it visible in the name, let the swatch be the guess
-    if (!d.name.toLowerCase().includes(declaredName.toLowerCase())) d.name += ` — ${declaredName}`;
   }
 }
 
@@ -551,9 +553,13 @@ function openColorwayModal(scraped, analysis) {
       <div class="modal" role="dialog" aria-label="Choose your colors">
         <h2>Which colors do you have?</h2>
         <p class="muted" style="margin:6px 0 14px">${esc(scraped.title || 'This item')} comes in ${scraped.colors.length} colors. Select every one you own — each becomes its own closet item.</p>
-        <div style="display:flex;flex-direction:column;gap:8px;max-height:44vh;overflow-y:auto">
+        <div style="display:flex;flex-direction:column;gap:8px;max-height:38vh;overflow-y:auto">
           ${scraped.colors.map((c, i) => `<label style="display:flex;gap:10px;align-items:center;font-size:14.5px"><input type="checkbox" data-cw="${i}" ${scraped.colors.length === 1 || (scraped.color && c === scraped.color) ? 'checked' : ''}> ${esc(c)}</label>`).join('')}
         </div>
+        ${scraped.sizes && scraped.sizes.length ? `
+        <div class="field" style="margin-top:16px"><label class="lab">Your size</label>
+          <select class="input" id="cw-size"><option value="">— pick a size —</option>${scraped.sizes.map(s => `<option>${esc(s)}</option>`).join('')}</select>
+        </div>` : ''}
         <div style="display:flex;gap:10px;margin-top:20px">
           <button class="btn primary" id="cw-add">Add selected</button>
           <button class="btn quiet" id="cw-cancel">Cancel</button>
@@ -566,11 +572,13 @@ function openColorwayModal(scraped, analysis) {
   document.getElementById('cw-add').addEventListener('click', () => {
     const picked = [...document.querySelectorAll('[data-cw]:checked')].map(cb => scraped.colors[+cb.dataset.cw]);
     if (!picked.length) { toast('Select at least one color.'); return; }
+    const size = document.getElementById('cw-size') ? document.getElementById('cw-size').value || null : null;
     for (const label of picked) {
       addDraft(analysis);
       const d = S.drafts[S.drafts.length - 1];
       if (scraped.title) d.name = scraped.title;
-      applyDeclaredColor(d, label);
+      if (label !== 'As shown') applyDeclaredColor(d, label);
+      d.size = size;
     }
     close();
     renderDrafts();
@@ -592,6 +600,8 @@ function addDraft(a) {
     name: `${best.name} top`,
     dressiness: 3,
     barcode: null,
+    brandColor: null,
+    size: null,
   };
   if (S.pendingBarcode) {
     draft.barcode = S.pendingBarcode.code;
@@ -644,6 +654,12 @@ function renderDrafts() {
   box.querySelectorAll('[data-d-name]').forEach(inp => inp.addEventListener('input', () => {
     S.drafts.find(x => x.id === inp.dataset.dName).name = inp.value;
   }));
+  box.querySelectorAll('[data-d-brandcolor]').forEach(inp => inp.addEventListener('input', () => {
+    S.drafts.find(x => x.id === inp.dataset.dBrandcolor).brandColor = inp.value;
+  }));
+  box.querySelectorAll('[data-d-size]').forEach(inp => inp.addEventListener('input', () => {
+    S.drafts.find(x => x.id === inp.dataset.dSize).size = inp.value;
+  }));
   box.querySelectorAll('[data-d-cat]').forEach(sel => sel.addEventListener('change', () => {
     const d = S.drafts.find(x => x.id === sel.dataset.dCat);
     d.category = sel.value;
@@ -675,6 +691,9 @@ function renderDrafts() {
         colors: [{ name: c.name, hex: c.hex }],
         dressiness: d.dressiness,
         img: d.img, imgKind: d.imgKind, barcode: d.barcode || null,
+        brandColor: (d.brandColor || '').trim() || null,
+        size: (d.size || '').trim() || null,
+        fitNote: null,
         laundry: false, wearCount: 0, lastWorn: null, createdAt: Date.now(),
       };
       await putRecord('items', item);
@@ -715,6 +734,10 @@ function draftRowHtml(d) {
           </select>
           <button class="btn quiet" data-d-dup="${d.id}" title="I have this in another color too">＋ Another color</button>
           <button class="btn quiet" data-d-del="${d.id}">Remove</button>
+        </div>
+        <div class="row">
+          <input class="input" style="max-width:220px" value="${esc(d.brandColor || '')}" data-d-brandcolor="${d.id}" placeholder="Brand's color name (e.g. Heather Fog)" aria-label="Brand color name">
+          <input class="input" style="max-width:120px" value="${esc(d.size || '')}" data-d-size="${d.id}" placeholder="Size" aria-label="Size">
         </div>
         <div class="row" style="max-width:380px;flex:1">
           <input type="range" min="1" max="5" step="1" value="${d.dressiness}" data-d-dress="${d.id}" aria-label="Dressiness">
@@ -765,7 +788,7 @@ function itemCardHtml(i) {
     <button class="item-card" data-item="${i.id}">
       <div class="item-img"><img src="${itemImg(i)}" alt="">${i.laundry ? '<span class="laundry-badge">In wash</span>' : ''}</div>
       <div class="item-name">${esc(i.name)}</div>
-      <div class="item-sub"><span class="swatch" style="background:${i.colors[0].hex}"></span>${esc(i.colors[0].name)} · ${DRESS_LABELS[i.dressiness]}</div>
+      <div class="item-sub"><span class="swatch" style="background:${i.colors[0].hex}"></span>${esc(i.colors[0].name)}${i.size ? ' · ' + esc(i.size) : ''} · ${DRESS_LABELS[i.dressiness]}</div>
     </button>`;
 }
 
@@ -782,6 +805,11 @@ function openItemModal(id) {
             <div class="field"><label class="lab">Color</label>
               <select class="input" id="mi-color">${NAMED_COLORS.map(c => `<option ${c.name === item.colors[0].name ? 'selected' : ''}>${c.name}</option>`).join('')}</select>
             </div>
+            <div class="field" style="display:flex;gap:10px">
+              <div style="flex:1"><label class="lab">Brand's color name</label><input class="input" id="mi-brandcolor" value="${esc(item.brandColor || '')}" placeholder="e.g. Heather Fog"></div>
+              <div style="width:110px"><label class="lab">Size</label><input class="input" id="mi-size" value="${esc(item.size || '')}" placeholder="M"></div>
+            </div>
+            <div class="field"><label class="lab">Fit note</label><input class="input" id="mi-fitnote" value="${esc(item.fitNote || '')}" placeholder="e.g. runs small — sized up"></div>
             <div class="field"><label class="lab">Dressiness — <span id="mi-dress-out">${DRESS_LABELS[item.dressiness]}</span></label>
               <input type="range" min="1" max="5" step="1" value="${item.dressiness}" id="mi-dress" style="width:100%">
             </div>
@@ -809,6 +837,9 @@ function openItemModal(id) {
     item.colors = [{ name: c.name, hex: c.hex }];
     item.dressiness = +document.getElementById('mi-dress').value;
     item.laundry = document.getElementById('mi-laundry').checked;
+    item.brandColor = document.getElementById('mi-brandcolor').value.trim() || null;
+    item.size = document.getElementById('mi-size').value.trim() || null;
+    item.fitNote = document.getElementById('mi-fitnote').value.trim() || null;
     if (colorChanged && item.imgKind === 'silhouette') item.img = garmentDataUrl(item.category, c.hex, item.name);
     await putRecord('items', item);
     close(); toast('Saved'); render(); dirty();

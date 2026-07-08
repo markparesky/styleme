@@ -30,14 +30,19 @@ export async function onRequestGet({ request }) {
           const image = (p.images && p.images[0] && p.images[0].src) || (p.image && p.image.src) || null;
           let color = null;
           let colors = null;
+          let sizes = null;
           if (Array.isArray(p.options)) {
             const oi = p.options.findIndex(o => /colou?r/i.test(o.name || ''));
             if (oi >= 0 && Array.isArray(p.variants)) {
               colors = [...new Set(p.variants.map(v => v['option' + (oi + 1)]).filter(Boolean))];
               color = colors[0] || null;
             }
+            const si = p.options.findIndex(o => /size/i.test(o.name || ''));
+            if (si >= 0 && Array.isArray(p.variants)) {
+              sizes = [...new Set(p.variants.map(v => v['option' + (si + 1)]).filter(Boolean))];
+            }
           }
-          if (image) return json({ image, title: p.title || null, color, colors });
+          if (image) return json({ image, title: p.title || null, color, colors, sizes });
         }
       }
     }
