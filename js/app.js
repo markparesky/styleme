@@ -242,12 +242,24 @@ function renderSyncCard() {
     <div class="card" style="max-width:640px">
       <h3>Your closet on every device</h3>
       <p class="muted" style="margin:8px 0 12px">Make up a closet code (like a password — at least 6 characters) and enter it here. Enter the same code on your phone or laptop and your closet appears there. Only a scrambled version of the code ever leaves this device.</p>
-      <div style="display:flex;gap:10px;flex-wrap:wrap">
+      <div style="display:flex;gap:10px;flex-wrap:wrap;align-items:center">
         <input class="input" id="sync-code-in" type="password" placeholder="Your closet code" style="max-width:260px" autocomplete="off">
         <button class="btn primary" id="sync-on">Turn on sync</button>
+        <button class="btn quiet" id="sync-suggest">Suggest a strong code</button>
       </div>
+      <p class="muted" style="font-size:12px;margin-top:10px">Treat it like a password — anyone who knows the code opens this closet. Write it down: it can't be recovered.</p>
     </div>` + backupHtml;
   bindBackupButtons();
+  document.getElementById('sync-suggest').addEventListener('click', () => {
+    const abc = 'abcdefghjkmnpqrstuvwxyz23456789'; // no lookalikes
+    const rnd = new Uint8Array(12);
+    crypto.getRandomValues(rnd);
+    const code = [...rnd].map((b, i) => abc[b % abc.length] + ((i + 1) % 4 === 0 && i < 11 ? '-' : '')).join('');
+    const input = document.getElementById('sync-code-in');
+    input.type = 'text';
+    input.value = code;
+    toast('Save this code somewhere safe — you’ll type it on your other devices.');
+  });
   document.getElementById('sync-on').addEventListener('click', async () => {
     const code = document.getElementById('sync-code-in').value.trim();
     if (code.length < 6) { toast('Use at least 6 characters.'); return; }
