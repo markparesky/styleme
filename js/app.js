@@ -1,8 +1,8 @@
 import { putRecord, deleteRecord, getAllRecords, getSetting, setSetting, uid, clearStore } from './db.js';
-import { pullCloud, pushCloud } from './sync.js';
+import { pullCloud, pushCloud, createShareLink, fetchSharedCloset, sendSuggestion, fetchSuggestions, dismissSuggestion } from './sync.js';
 import { analyzeImage, fileToDataUrl, NAMED_COLORS, metaForColorName } from './color.js';
 import { CATEGORIES, garmentDataUrl } from './garments.js';
-import { OCCASIONS, DRESS_CODES, DRESS_LABELS, targetFromText, generateOutfits, swapAlternatives, capsulePlan, ACTIVITIES } from './stylist.js';
+import { OCCASIONS, DRESS_CODES, DRESS_LABELS, targetFromText, generateOutfits, swapAlternatives, capsulePlan, ACTIVITIES, scoreOutfit } from './stylist.js';
 import { geocode, forecast, describeWmo } from './weather.js';
 import { demoItems } from './demo.js';
 
@@ -106,8 +106,16 @@ function nav(route) {
   location.hash = '#/' + route;
   render();
 }
+function parseRoute() {
+  const h = location.hash.replace('#/', '') || 'home';
+  if (h.startsWith('stylist-for/')) {
+    S.shareToken = h.slice('stylist-for/'.length);
+    return 'stylist-for';
+  }
+  return h;
+}
 window.addEventListener('hashchange', () => {
-  const r = location.hash.replace('#/', '') || 'home';
+  const r = parseRoute();
   if (r !== S.route) { S.route = r; render(); }
 });
 document.querySelector('.topbar').addEventListener('click', e => {
@@ -117,7 +125,7 @@ document.querySelector('.topbar').addEventListener('click', e => {
 
 function render() {
   document.querySelectorAll('.navbtn').forEach(b => b.classList.toggle('active', b.dataset.nav === S.route));
-  const views = { home: viewHome, add: viewAdd, closet: viewCloset, stylist: viewStylist, pack: viewPack, lookbook: viewLookbook };
+  const views = { home: viewHome, add: viewAdd, closet: viewCloset, stylist: viewStylist, pack: viewPack, lookbook: viewLookbook, 'stylist-for': viewStylistFor };
   (views[S.route] || viewHome)();
   window.scrollTo(0, 0);
 }
@@ -230,10 +238,30 @@ function renderSyncCard() {
           <button class="btn line" id="sync-push">Sync now</button>
           <button class="btn quiet" id="sync-off">Turn off on this device</button>
         </div>
+      </div>
+      <div class="card" style="max-width:640px;margin-top:20px">
+        <h3>Let someone style you</h3>
+        <p class="muted" style="margin:8px 0 12px">Send a private link to your wife, a friend, or a stylist. They see your closet (view only) and send you outfits — you'll find them under "Picked for you" in the Stylist tab. Making a new link turns off the old one.</p>
+        <div style="display:flex;gap:10px;flex-wrap:wrap;align-items:center">
+          <button class="btn line" id="share-make">Create stylist link</button>
+          <span id="share-out" class="muted" style="font-size:12.5px;word-break:break-all"></span>
+        </div>
       </div>` + backupHtml;
     document.getElementById('sync-push').addEventListener('click', async () => { await pushNow(); toast('Synced'); });
     document.getElementById('sync-off').addEventListener('click', async () => {
       S.syncCode = null; await setSetting('syncCode', null); renderSyncCard();
+    });
+    document.getElementById('share-make').addEventListener('click', async () => {
+      await pushNow(); // make sure the cloud copy is current before sharing
+      const r = await createShareLink(S.syncCode);
+      if (r.error) { toast(r.error); return; }
+      document.getElementById('share-out').textContent = r.url;
+      if (navigator.share) {
+        try { await navigator.share({ title: 'Style my closet', url: r.url }); } catch { /* user closed the sheet */ }
+      } else if (navigator.clipboard) {
+        await navigator.clipboard.writeText(r.url).catch(() => {});
+        toast('Link copied — send it to your stylist');
+      }
     });
     bindBackupButtons();
     return;
@@ -1028,8 +1056,13 @@ function viewStylist() {
       <div class="field"><label class="lab">Dress codes</label>
         <div class="chiprow">${DRESS_CODES.map(o => `<button class="chip ${st.chip === o.label ? 'on' : ''}" data-occ-chip="${esc(o.label)}" data-occ-target="${o.target}">${o.label}</button>`).join('')}</div>
       </div>
-      <button class="btn primary" id="st-go">✦ Style me</button>
+      <div style="display:flex;gap:10px;flex-wrap:wrap">
+        <button class="btn primary" id="st-go">✦ Style me</button>
+        <button class="btn line" id="st-build">Build one myself</button>
+      </div>
     </div>
+    <div id="st-picked" style="margin-top:26px"></div>
+    <div id="st-builder-wrap" style="margin-top:26px;display:none"><div class="card" style="max-width:760px"><h3 style="margin-bottom:14px">Build an outfit by hand</h3><div id="st-builder"></div></div></div>
     <div class="outfits" id="st-results"></div>`;
 
   $view.querySelectorAll('[data-occ-chip]').forEach(b => b.addEventListener('click', () => {
@@ -1039,7 +1072,51 @@ function viewStylist() {
   }));
   document.getElementById('st-text').addEventListener('input', e => { st.text = e.target.value; });
   document.getElementById('st-go').addEventListener('click', runStylist);
+  document.getElementById('st-build').addEventListener('click', () => {
+    const wrap = document.getElementById('st-builder-wrap');
+    const show = wrap.style.display === 'none';
+    wrap.style.display = show ? 'block' : 'none';
+    if (show) {
+      renderBuilder(document.getElementById('st-builder'), S.items.filter(i => !i.laundry), {
+        submitLabel: 'Wear it → Mirror check',
+        nameField: false,
+        onSubmit: ({ items, note }) => openMirrorModal(items.map(i => i.id), note || 'Styled by hand'),
+      });
+    }
+  });
   renderOutfits();
+  renderPickedForYou();
+}
+
+async function renderPickedForYou() {
+  const box = document.getElementById('st-picked');
+  if (!box || !S.syncCode) return;
+  const suggs = await fetchSuggestions(S.syncCode);
+  if (!suggs.length) { box.innerHTML = ''; return; }
+  box.innerHTML = `
+    <div class="sec-head" style="margin-bottom:14px"><h2 style="font-family:var(--serif);font-size:24px">Picked for you</h2></div>
+    <div class="outfits">
+      ${suggs.map(s => {
+        const items = s.itemIds.map(id => S.items.find(i => i.id === id)).filter(Boolean);
+        if (!items.length) return '';
+        return `
+          <div class="outfit-card">
+            <div class="oc-head"><span class="oc-title">From ${esc(s.from)}</span><span class="oc-meta">${fmtDate(s.at)}</span></div>
+            ${flatlayHtml(items)}
+            ${s.note ? `<div class="why">“${esc(s.note)}”</div>` : ''}
+            <div class="slotrow">${items.map(i => `<span class="slot">${esc(catLabel(i.category))} · ${esc(i.name)}</span>`).join('')}</div>
+            <div class="oc-actions">
+              <button class="btn primary" data-wear='${esc(JSON.stringify(items.map(i => i.id)))}' data-occ="Picked by ${esc(s.from)}">Wear it → Mirror check</button>
+              <button class="btn quiet" data-sugg-dismiss="${esc(s.id)}">Dismiss</button>
+            </div>
+          </div>`;
+      }).join('')}
+    </div>`;
+  bindWearButtons();
+  box.querySelectorAll('[data-sugg-dismiss]').forEach(b => b.addEventListener('click', async () => {
+    await dismissSuggestion(S.syncCode, b.dataset.suggDismiss);
+    renderPickedForYou();
+  }));
 }
 
 function stylistTarget() {
@@ -1104,6 +1181,101 @@ function outfitCardHtml(o, idx, title) {
         <button class="btn line" data-shuffle="${idx}">Shuffle</button>
       </div>
     </div>`;
+}
+
+// ============================================================ OUTFIT BUILDER (human styling)
+// Shared by the invited-stylist view and "Build one myself".
+const BUILDER_SLOTS = [
+  { cat: 'top', label: 'Top' }, { cat: 'bottom', label: 'Bottom' },
+  { cat: 'dress', label: 'Dress (instead of top + bottom)' },
+  { cat: 'layer', label: 'Layer (optional)' }, { cat: 'shoes', label: 'Shoes' },
+  { cat: 'accessory', label: 'Accessory (optional)' },
+];
+
+function renderBuilder(container, items, opts) {
+  const sel = {}; // cat -> item
+  const draw = () => {
+    const chosen = Object.values(sel);
+    const complete = sel.shoes && (sel.dress || (sel.top && sel.bottom));
+    let hint = '';
+    if (chosen.length >= 2) {
+      const s = scoreOutfit(chosen, 3, null);
+      const grade = s.score >= 85 ? 'Excellent' : s.score >= 65 ? 'Strong' : 'Workable';
+      hint = `<div class="harmony-hint"><b>${grade} colors.</b> ${esc(s.why[0] || '')}</div>`;
+    }
+    container.innerHTML = `
+      ${chosen.length ? flatlayHtml(chosen) : '<div class="flatlay" style="display:flex;align-items:center;justify-content:center;color:var(--stone);font-size:14px">Tap pieces below to build the look</div>'}
+      ${hint}
+      ${BUILDER_SLOTS.map(slot => {
+        const inCat = items.filter(i => i.category === slot.cat);
+        if (!inCat.length) return '';
+        return `
+          <div class="builder-slot">
+            <label class="lab">${slot.label}</label>
+            <div class="strip">
+              ${inCat.map(i => `
+                <button class="pick ${sel[slot.cat] && sel[slot.cat].id === i.id ? 'sel' : ''}" data-b-pick="${slot.cat}:${i.id}">
+                  <img src="${itemImg(i)}" alt=""><span>${esc(i.name)}</span>
+                </button>`).join('')}
+            </div>
+          </div>`;
+      }).join('')}
+      ${opts.nameField ? `<div class="field"><label class="lab">Your name</label><input class="input" id="b-from" placeholder="e.g. Rebecca" style="max-width:240px" value="${esc(opts.fromDefault || '')}"></div>` : ''}
+      <div class="field"><label class="lab">Note (optional)</label><input class="input" id="b-note" placeholder="e.g. for the dinner on Friday — with the sleeves rolled"></div>
+      <div style="display:flex;gap:10px;flex-wrap:wrap">
+        <button class="btn primary" id="b-submit" ${complete ? '' : 'disabled'}>${esc(opts.submitLabel)}</button>
+        <span class="muted" style="font-size:12.5px;align-self:center">${complete ? '' : 'Needs shoes plus a top and bottom (or a dress).'}</span>
+      </div>`;
+    container.querySelectorAll('[data-b-pick]').forEach(b => b.addEventListener('click', () => {
+      const [cat, id] = b.dataset.bPick.split(':');
+      const item = items.find(i => i.id === id);
+      const note = container.querySelector('#b-note').value;
+      const from = container.querySelector('#b-from') ? container.querySelector('#b-from').value : null;
+      if (sel[cat] && sel[cat].id === id) delete sel[cat];
+      else {
+        sel[cat] = item;
+        if (cat === 'dress') { delete sel.top; delete sel.bottom; }
+        if (cat === 'top' || cat === 'bottom') delete sel.dress;
+      }
+      draw();
+      container.querySelector('#b-note').value = note;
+      if (from !== null && container.querySelector('#b-from')) container.querySelector('#b-from').value = from;
+    }));
+    const submit = container.querySelector('#b-submit');
+    if (submit) submit.addEventListener('click', () => {
+      opts.onSubmit({
+        items: Object.values(sel),
+        note: container.querySelector('#b-note').value.trim(),
+        from: container.querySelector('#b-from') ? container.querySelector('#b-from').value.trim() : null,
+      });
+    });
+  };
+  draw();
+}
+
+// The invited stylist's page — read-only closet, build & send
+async function viewStylistFor() {
+  $view.innerHTML = `<div class="pagehead"><h1>Style this closet</h1><p>Loading the closet…</p></div>`;
+  const r = await fetchSharedCloset(S.shareToken);
+  if (r.error) {
+    $view.innerHTML = `<div class="pagehead"><h1>Style this closet</h1></div><div class="empty-shelf" style="padding:40px">${esc(r.error)}</div>`;
+    return;
+  }
+  $view.innerHTML = `
+    <div class="pagehead"><h1>Style this closet</h1><p>You've been invited to pick out an outfit — from their real clothes. Tap pieces, watch the look come together, send it with a note.</p></div>
+    <div class="card" style="max-width:760px"><div id="builder"></div></div>`;
+  renderBuilder(document.getElementById('builder'), r.items, {
+    submitLabel: 'Send this outfit',
+    nameField: true,
+    onSubmit: async ({ items, note, from }) => {
+      const res = await sendSuggestion(S.shareToken, { itemIds: items.map(i => i.id), note, from });
+      if (res.error) { toast(res.error); return; }
+      $view.innerHTML = `
+        <div class="pagehead"><h1>Sent ✓</h1><p>Your pick is waiting in their Stylist tab.</p></div>
+        <button class="btn primary" id="again">Style another outfit</button>`;
+      document.getElementById('again').addEventListener('click', viewStylistFor);
+    },
+  });
 }
 
 // ============================================================ MIRROR CHECK
@@ -1342,7 +1514,7 @@ async function boot() {
   S.wears = await getAllRecords('wears');
   S.homeCity = await getSetting('homeCity');
   S.syncCode = await getSetting('syncCode');
-  S.route = location.hash.replace('#/', '') || 'home';
+  S.route = parseRoute();
   render();
   if (S.syncCode) pullOnBoot();
 }

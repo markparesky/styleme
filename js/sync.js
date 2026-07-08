@@ -21,6 +21,42 @@ export async function pullCloud(code) {
   }
 }
 
+// ---- stylist sharing ----
+export async function createShareLink(code) {
+  const id = await codeToId(code);
+  const res = await fetch('/api/share', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ id }) });
+  const j = await res.json();
+  if (!res.ok) return { error: j.error || ('Failed (' + res.status + ')') };
+  return { url: location.origin + '/#/stylist-for/' + j.token };
+}
+
+export async function fetchSharedCloset(token) {
+  const res = await fetch('/api/share?token=' + encodeURIComponent(token));
+  const j = await res.json();
+  if (!res.ok) return { error: j.error || 'That link did not work.' };
+  return { items: j.items };
+}
+
+export async function sendSuggestion(token, outfit) {
+  const res = await fetch('/api/suggest', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ token, outfit }) });
+  const j = await res.json();
+  return res.ok ? { ok: true } : { error: j.error || 'Could not send.' };
+}
+
+export async function fetchSuggestions(code) {
+  try {
+    const id = await codeToId(code);
+    const res = await fetch('/api/suggestions?id=' + id);
+    if (!res.ok) return [];
+    return await res.json();
+  } catch { return []; }
+}
+
+export async function dismissSuggestion(code, removeId) {
+  const id = await codeToId(code);
+  await fetch('/api/suggestions', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ id, removeId }) }).catch(() => {});
+}
+
 // Returns { ok: true } | { unconfigured: true } | { error }
 export async function pushCloud(code, data) {
   try {
