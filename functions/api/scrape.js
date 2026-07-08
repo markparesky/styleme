@@ -14,6 +14,31 @@ export async function onRequestGet({ request }) {
   const target = new URL(request.url).searchParams.get('url');
   if (!target || !/^https?:\/\//i.test(target)) return json({ error: 'Provide ?url=https://…' }, 400);
 
+  // Shopify stores (a huge share of fashion brands) expose product data at
+  // <product-url>.json even when the HTML page is bot-protected. Try it first.
+  try {
+    const u = new URL(target);
+    if (/\/products\/[^/]+\/?$/.test(u.pathname)) {
+      const jres = await fetch(u.origin + u.pathname.replace(/\/$/, '') + '.json', {
+        headers: { 'User-Agent': UA, 'Accept': 'application/json' },
+        redirect: 'follow',
+      });
+      if (jres.ok && (jres.headers.get('content-type') || '').includes('json')) {
+        const j = await jres.json();
+        const p = j.product;
+        if (p) {
+          const image = (p.images && p.images[0] && p.images[0].src) || (p.image && p.image.src) || null;
+          let color = null;
+          if (Array.isArray(p.options)) {
+            const oi = p.options.findIndex(o => /colou?r/i.test(o.name || ''));
+            if (oi >= 0 && p.variants && p.variants[0]) color = p.variants[0]['option' + (oi + 1)] || null;
+          }
+          if (image) return json({ image, title: p.title || null, color });
+        }
+      }
+    }
+  } catch { /* not Shopify — fall through to HTML scrape */ }
+
   let res;
   try {
     res = await fetch(target, {

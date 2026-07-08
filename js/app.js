@@ -420,7 +420,7 @@ async function handleUrl() {
     setTimeout(() => res(false), 6000);
   });
   if (!canDisplay) {
-    toast('That site blocks its images entirely — save the photo to your device and upload it instead.');
+    toast('This retailer blocks readers. On the product page, right-click the photo → "Copy image address" and paste that here — or save the photo and upload it.');
     return;
   }
   S.drafts.push({
