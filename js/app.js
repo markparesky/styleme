@@ -276,6 +276,10 @@ function renderSyncCard() {
         <button class="btn quiet" id="sync-suggest">Suggest a strong code</button>
       </div>
       <p class="muted" style="font-size:12px;margin-top:10px">Treat it like a password — anyone who knows the code opens this closet. Write it down: it can't be recovered.</p>
+    </div>
+    <div class="card" style="max-width:640px;margin-top:20px;opacity:.75">
+      <h3>Let someone style you</h3>
+      <p class="muted" style="margin:8px 0 0">Send a private link to your wife or a stylist — they see your closet (view only) and send you outfits. <b>Turn on sync above first</b>, and this unlocks.</p>
     </div>` + backupHtml;
   bindBackupButtons();
   document.getElementById('sync-suggest').addEventListener('click', () => {
