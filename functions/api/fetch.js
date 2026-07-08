@@ -11,7 +11,7 @@ export async function onRequestGet({ request }) {
   try {
     upstream = await fetch(target, {
       headers: {
-        'User-Agent': 'Mozilla/5.0 (compatible; StyleMe/1.0)',
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
         'Accept': 'image/avif,image/webp,image/png,image/jpeg,image/*;q=0.8',
       },
       redirect: 'follow',

@@ -367,18 +367,46 @@ async function fetchImageBlob(url) {
   return null;
 }
 
+// Product PAGE → { image, title, color } via the server-side scraper
+async function scrapeProductPage(url) {
+  try {
+    const res = await fetch('/api/scrape?url=' + encodeURIComponent(url));
+    if (res.ok) return await res.json();
+  } catch { /* not hosted or scrape failed */ }
+  return null;
+}
+
 async function handleUrl() {
   const url = document.getElementById('url-in').value.trim();
   if (!url) return;
-  toast('Fetching image…');
-  const blob = await fetchImageBlob(url);
+  toast('Fetching…');
+  let blob = await fetchImageBlob(url);
+  let scraped = null;
+  if (!blob) {
+    // Not a direct image — treat it as a product page and scrape it
+    scraped = await scrapeProductPage(url);
+    if (scraped && scraped.image) blob = await fetchImageBlob(scraped.image);
+  }
   if (blob) {
     const dataUrl = await new Promise((ok, no) => { const r = new FileReader(); r.onload = () => ok(r.result); r.onerror = no; r.readAsDataURL(blob); });
     try {
       const a = await analyzeImage(dataUrl);
       addDraft(a);
+      const d = S.drafts[S.drafts.length - 1];
+      if (scraped) {
+        if (scraped.title) d.name = scraped.title;
+        // The retailer's own declared color outranks our pixel guess
+        if (scraped.color) {
+          const declared = NAMED_COLORS.find(c => scraped.color.toLowerCase().includes(c.name.toLowerCase()));
+          if (declared && !d.options.some(o => o.name === declared.name)) {
+            d.options = [declared, ...d.options].slice(0, 3);
+          }
+          if (declared) d.colorIdx = d.options.findIndex(o => o.name === declared.name);
+        }
+      }
       renderDrafts();
       document.getElementById('url-in').value = '';
+      toast(scraped && scraped.title ? `Found "${scraped.title}"` : 'Image added — review below.');
       return;
     } catch { /* unreadable image data — fall through */ }
   }
