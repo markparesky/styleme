@@ -21,8 +21,9 @@ img{max-width:100%}
 .wrap{max-width:1060px;margin:0 auto;padding:0 24px}
 
 /* ---------- topbar ---------- */
-.topbar{background:#fff;border-bottom:1px solid var(--line);position:sticky;top:0;z-index:40}
+.topbar{background:#fff;border-bottom:1px solid var(--line);position:sticky;top:0;z-index:40;padding-top:env(safe-area-inset-top)}
 .topbar-inner{display:flex;align-items:center;gap:8px;max-width:1060px;margin:0 auto;padding:12px 24px}
+main{padding-left:env(safe-area-inset-left);padding-right:env(safe-area-inset-right)}
 .brand{font-weight:700;font-size:19px;margin-right:auto;font-family:var(--sans);letter-spacing:-.01em}
 .navbtn{padding:8px 16px;border-radius:999px;font-size:14px;font-weight:500;color:var(--ink)}
 .navbtn:hover{background:var(--paper)}

@@ -1278,3 +1278,8 @@ async function boot() {
   if (S.syncCode) pullOnBoot();
 }
 boot();
+
+// installable app: offline shell + home-screen behavior
+if ('serviceWorker' in navigator) {
+  navigator.serviceWorker.register('/sw.js').catch(() => { /* http local dev — fine */ });
+}
