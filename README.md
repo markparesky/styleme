@@ -22,7 +22,9 @@ plain HTML/CSS/JS modules. All data stays on the device in IndexedDB.
 - **Lookbook** — every worn look with photo (or mini flat-lay), date, occasion,
   rating.
 - **Barcode scan** — scan a purchased item's tag with the camera (or a photo
-  of it) using the browser's built-in BarcodeDetector (Chrome/Edge). Public
+  of it). Uses the browser's built-in BarcodeDetector where it truly works,
+  and automatically falls back to a WebAssembly decoder (zbar, loaded from
+  CDN on first use) everywhere else — Windows desktop and iPhone included. Public
   product databases are tried for a name/photo; apparel coverage is spotty, so
   the barcode always attaches to the item as its identifier and one photo of
   the garment supplies true color.

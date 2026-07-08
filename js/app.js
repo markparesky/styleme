@@ -325,32 +325,71 @@ function viewAdd() {
 }
 
 // ---------- barcode ----------
+// The native BarcodeDetector API is defined on Windows/iOS but often has no
+// OS backend — it "works" while detecting nothing. We probe it once; if the
+// probe fails we load a WebAssembly decoder (zbar) that works everywhere.
 const BC_FORMATS = ['ean_13', 'ean_8', 'upc_a', 'upc_e', 'code_128', 'code_39', 'itf', 'qr_code'];
+let detectorPromise = null;
 
 function bcStatus(msg) {
   const el = document.getElementById('bc-status');
   if (el) el.textContent = msg;
 }
 
-function barcodeSupported() {
-  if ('BarcodeDetector' in window) return true;
-  bcStatus('This browser has no built-in barcode reader — use Chrome or Edge, or just photograph the item itself.');
-  return false;
+function frameToCanvas(src) {
+  if (src instanceof HTMLCanvasElement) return src;
+  const w = src.videoWidth || src.width, h = src.videoHeight || src.height;
+  const scale = Math.min(1, 1600 / Math.max(w, h));
+  const c = document.createElement('canvas');
+  c.width = Math.max(1, Math.round(w * scale));
+  c.height = Math.max(1, Math.round(h * scale));
+  c.getContext('2d').drawImage(src, 0, 0, c.width, c.height);
+  return c;
+}
+
+function getDetector() {
+  if (detectorPromise) return detectorPromise;
+  detectorPromise = (async () => {
+    if ('BarcodeDetector' in window) {
+      try {
+        const native = new BarcodeDetector({ formats: BC_FORMATS });
+        const probe = document.createElement('canvas');
+        probe.width = probe.height = 32;
+        await native.detect(probe); // rejects on platforms with no backend
+        return async src => (await native.detect(src)).map(c => c.rawValue);
+      } catch { /* fall through to wasm */ }
+    }
+    const zbar = await import('https://cdn.jsdelivr.net/npm/@undecaf/zbar-wasm/+esm');
+    return async src => {
+      const c = frameToCanvas(src);
+      const data = c.getContext('2d', { willReadFrequently: true }).getImageData(0, 0, c.width, c.height);
+      const syms = await zbar.scanImageData(data);
+      return syms.map(s => s.decode());
+    };
+  })();
+  detectorPromise.catch(() => { detectorPromise = null; }); // retry next time
+  return detectorPromise;
 }
 
 async function scanBarcodeFromFile(file) {
-  if (!barcodeSupported()) return;
+  bcStatus('Reading the photo…');
+  let detect;
+  try { detect = await getDetector(); }
+  catch { bcStatus('No barcode reader could be loaded in this browser — photograph the item itself instead.'); return; }
   try {
     const bmp = await createImageBitmap(file);
-    const det = new BarcodeDetector({ formats: BC_FORMATS });
-    const codes = await det.detect(bmp);
-    if (!codes.length) { bcStatus('No barcode found in that photo — get closer so the bars fill the frame.'); return; }
-    await handleBarcode(codes[0].rawValue);
+    const codes = await detect(bmp);
+    if (!codes.length) { bcStatus('No barcode found — fill the frame with the bars, flat and well-lit.'); return; }
+    await handleBarcode(codes[0]);
   } catch (err) { bcStatus(`Could not read that photo (${err.message}).`); }
 }
 
 async function scanBarcodeLive() {
-  if (!barcodeSupported()) return;
+  bcStatus('Loading the barcode reader…');
+  let detect;
+  try { detect = await getDetector(); }
+  catch { bcStatus('No barcode reader could be loaded in this browser — try "Photo of the barcode".'); return; }
+  bcStatus('');
   let stream;
   try {
     stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'environment' } });
@@ -366,7 +405,6 @@ async function scanBarcodeLive() {
     </div>`;
   const video = document.getElementById('bc-video');
   video.srcObject = stream;
-  const det = new BarcodeDetector({ formats: BC_FORMATS });
   let alive = true;
   const stop = () => { alive = false; stream.getTracks().forEach(t => t.stop()); $modal.innerHTML = ''; };
   document.getElementById('bc-cancel').addEventListener('click', stop);
@@ -377,11 +415,11 @@ async function scanBarcodeLive() {
     if (Date.now() - started > 45000) { stop(); bcStatus('Gave up after 45s — try a photo of the barcode instead.'); return; }
     try {
       if (video.readyState >= 2) {
-        const codes = await det.detect(video);
-        if (codes.length) { const v = codes[0].rawValue; stop(); await handleBarcode(v); return; }
+        const codes = await detect(video);
+        if (codes.length) { const v = codes[0]; stop(); await handleBarcode(v); return; }
       }
     } catch { /* keep scanning */ }
-    setTimeout(tick, 250);
+    setTimeout(tick, 350);
   };
   tick();
 }
