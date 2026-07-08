@@ -1524,3 +1524,35 @@ boot();
 if ('serviceWorker' in navigator) {
   navigator.serviceWorker.register('/sw.js').catch(() => { /* http local dev — fine */ });
 }
+
+// Update notice: the home-screen app can sit suspended for days. Whenever it
+// comes back to the foreground, compare the deployed code against what's
+// running; if it changed, offer a one-tap update.
+let shellFingerprint = null;
+async function fetchFingerprint() {
+  try {
+    const [html, js] = await Promise.all([
+      fetch('/index.html', { cache: 'no-store' }).then(r => r.text()),
+      fetch('/js/app.js', { cache: 'no-store' }).then(r => r.text()),
+    ]);
+    const buf = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(html + js));
+    return [...new Uint8Array(buf)].slice(0, 8).map(b => b.toString(16).padStart(2, '0')).join('');
+  } catch { return null; }
+}
+async function checkForUpdate() {
+  const fp = await fetchFingerprint();
+  if (!fp) return;
+  if (!shellFingerprint) { shellFingerprint = fp; return; }
+  if (fp !== shellFingerprint) {
+    const t = document.getElementById('toast');
+    t.textContent = 'A new version is ready — tap to update';
+    t.classList.add('show');
+    t.style.pointerEvents = 'auto';
+    t.style.cursor = 'pointer';
+    t.onclick = () => location.reload();
+    clearTimeout(t._h); // stays until tapped or replaced
+  }
+}
+fetchFingerprint().then(fp => { shellFingerprint = fp; });
+document.addEventListener('visibilitychange', () => { if (!document.hidden) checkForUpdate(); });
+setInterval(checkForUpdate, 20 * 60 * 1000);
