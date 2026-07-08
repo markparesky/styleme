@@ -135,7 +135,9 @@ async function viewHome() {
           <button class="btn primary" data-nav-inline="add">Add my clothes</button>
           <button class="btn line" id="seed-demo">Load demo closet (14 items)</button>
         </div>
-      </div>`;
+      </div>
+      <div class="morning" id="synccard"></div>`;
+    renderSyncCard();
     document.getElementById('seed-demo').addEventListener('click', async () => {
       const items = demoItems();
       for (const it of items) await putRecord('items', it);
@@ -163,9 +165,62 @@ async function viewHome() {
   renderSyncCard();
 }
 
+function bindBackupButtons() {
+  document.getElementById('bk-export').addEventListener('click', exportCloset);
+  document.getElementById('bk-import').addEventListener('click', () => document.getElementById('bk-file').click());
+  document.getElementById('bk-file').addEventListener('change', e => {
+    if (e.target.files[0]) importCloset(e.target.files[0]);
+    e.target.value = '';
+  });
+}
+
+function exportCloset() {
+  const payload = { app: 'styleme', exportedAt: new Date().toISOString(), items: S.items, wears: S.wears, homeCity: S.homeCity };
+  const blob = new Blob([JSON.stringify(payload)], { type: 'application/json' });
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = `styleme-closet-${new Date().toISOString().slice(0, 10)}.json`;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  URL.revokeObjectURL(a.href);
+  toast(`Backup saved — ${S.items.length} items, ${S.wears.length} looks`);
+}
+
+async function importCloset(file) {
+  let data;
+  try { data = JSON.parse(await file.text()); } catch { toast('That file is not a StyleMe backup.'); return; }
+  if (!data || data.app !== 'styleme' || !Array.isArray(data.items)) { toast('That file is not a StyleMe backup.'); return; }
+  const replace = S.items.length === 0 ||
+    window.confirm('Replace this device’s closet with the backup?\n\nOK = replace everything\nCancel = merge (adds what’s missing)');
+  if (replace) {
+    await clearStore('items'); await clearStore('wears');
+    S.items = []; S.wears = [];
+  }
+  let added = 0;
+  const haveItems = new Set(S.items.map(i => i.id));
+  for (const it of data.items) if (!haveItems.has(it.id)) { S.items.push(it); await putRecord('items', it); added++; }
+  const haveWears = new Set(S.wears.map(w => w.id));
+  for (const w of (data.wears || [])) if (!haveWears.has(w.id)) { S.wears.push(w); await putRecord('wears', w); }
+  if (data.homeCity && !S.homeCity) { S.homeCity = data.homeCity; await setSetting('homeCity', data.homeCity); }
+  toast(`Imported ${added} item${added === 1 ? '' : 's'}`);
+  dirty();
+  render();
+}
+
 function renderSyncCard() {
   const box = document.getElementById('synccard');
   if (!box) return;
+  const backupHtml = `
+    <div class="card" style="max-width:640px;margin-top:20px">
+      <h3>Backup &amp; transfer</h3>
+      <p class="muted" style="margin:8px 0 12px">Save your closet as a file, or load one saved on another device or browser. Works with no setup.</p>
+      <div style="display:flex;gap:10px;flex-wrap:wrap">
+        <button class="btn line" id="bk-export">Export closet</button>
+        <button class="btn line" id="bk-import">Import closet</button>
+        <input type="file" id="bk-file" accept=".json,application/json" hidden>
+      </div>
+    </div>`;
   if (S.syncCode) {
     box.innerHTML = `
       <div class="card" style="max-width:640px">
@@ -175,11 +230,12 @@ function renderSyncCard() {
           <button class="btn line" id="sync-push">Sync now</button>
           <button class="btn quiet" id="sync-off">Turn off on this device</button>
         </div>
-      </div>`;
+      </div>` + backupHtml;
     document.getElementById('sync-push').addEventListener('click', async () => { await pushNow(); toast('Synced'); });
     document.getElementById('sync-off').addEventListener('click', async () => {
       S.syncCode = null; await setSetting('syncCode', null); renderSyncCard();
     });
+    bindBackupButtons();
     return;
   }
   box.innerHTML = `
@@ -190,7 +246,8 @@ function renderSyncCard() {
         <input class="input" id="sync-code-in" type="password" placeholder="Your closet code" style="max-width:260px" autocomplete="off">
         <button class="btn primary" id="sync-on">Turn on sync</button>
       </div>
-    </div>`;
+    </div>` + backupHtml;
+  bindBackupButtons();
   document.getElementById('sync-on').addEventListener('click', async () => {
     const code = document.getElementById('sync-code-in').value.trim();
     if (code.length < 6) { toast('Use at least 6 characters.'); return; }
