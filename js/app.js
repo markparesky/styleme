@@ -353,22 +353,65 @@ async function handleFiles(files) {
   renderDrafts();
 }
 
+async function fetchImageBlob(url) {
+  // 1. direct (works for CORS-friendly hosts)
+  try {
+    const res = await fetch(url);
+    if (res.ok) { const b = await res.blob(); if (b.type.startsWith('image/')) return b; }
+  } catch { /* blocked — try the server function */ }
+  // 2. via the Pages Function (server-side fetch, no CORS limits; available when hosted)
+  try {
+    const res = await fetch('/api/fetch?url=' + encodeURIComponent(url));
+    if (res.ok) { const b = await res.blob(); if (b.type.startsWith('image/')) return b; }
+  } catch { /* not hosted or upstream failed */ }
+  return null;
+}
+
 async function handleUrl() {
   const url = document.getElementById('url-in').value.trim();
   if (!url) return;
   toast('Fetching image…');
-  try {
-    const res = await fetch(url);
-    if (!res.ok) throw new Error('Could not fetch that link.');
-    const blob = await res.blob();
-    if (!blob.type.startsWith('image/')) throw new Error('That link is not a direct image.');
+  const blob = await fetchImageBlob(url);
+  if (blob) {
     const dataUrl = await new Promise((ok, no) => { const r = new FileReader(); r.onload = () => ok(r.result); r.onerror = no; r.readAsDataURL(blob); });
-    const a = await analyzeImage(dataUrl);
-    addDraft(a);
-    renderDrafts();
-  } catch (err) {
-    toast(`${err.message} (Some sites block cross-site fetches — save the image and upload it instead.)`);
+    try {
+      const a = await analyzeImage(dataUrl);
+      addDraft(a);
+      renderDrafts();
+      document.getElementById('url-in').value = '';
+      return;
+    } catch { /* unreadable image data — fall through */ }
   }
+  // Fallback: the site blocks fetching. Show the image straight from their server
+  // (browsers may display what they won't let us read) and ask for the color.
+  const canDisplay = await new Promise(res => {
+    const img = new Image();
+    img.onload = () => res(true);
+    img.onerror = () => res(false);
+    img.src = url;
+    setTimeout(() => res(false), 6000);
+  });
+  if (!canDisplay) {
+    toast('That site blocks its images entirely — save the photo to your device and upload it instead.');
+    return;
+  }
+  S.drafts.push({
+    id: uid(),
+    img: url,
+    imgKind: 'remote',
+    corrected: false,
+    cutout: false,
+    manualColor: true,
+    options: NAMED_COLORS,
+    colorIdx: 0,
+    category: 'top',
+    name: 'New item',
+    dressiness: 3,
+    barcode: null,
+  });
+  renderDrafts();
+  document.getElementById('url-in').value = '';
+  toast('Image added — this site hides its colors from us, so pick the color below.');
 }
 
 function addDraft(a) {
@@ -418,6 +461,14 @@ function renderDrafts() {
     }
     renderDrafts();
   }));
+  box.querySelectorAll('[data-d-colorsel]').forEach(sel => sel.addEventListener('change', () => {
+    const d = S.drafts.find(x => x.id === sel.dataset.dColorsel);
+    d.colorIdx = +sel.value;
+    if (d.name === 'New item' || NAMED_COLORS.some(c => d.name.startsWith(c.name + ' '))) {
+      d.name = `${d.options[d.colorIdx].name} ${catLabel(d.category).toLowerCase()}`;
+    }
+    renderDrafts();
+  }));
   box.querySelectorAll('[data-d-name]').forEach(inp => inp.addEventListener('input', () => {
     S.drafts.find(x => x.id === inp.dataset.dName).name = inp.value;
   }));
@@ -463,16 +514,19 @@ function draftRowHtml(d) {
   if (d.corrected) notes.push('Warm cast removed ✓');
   if (d.cutout) notes.push('Background cut out ✓');
   if (d.barcode) notes.push(`Barcode ${d.barcode} attached ✓`);
-  const noteHtml = notes.length ? `<span class="qnote">${notes.join(' · ')}</span>` :
+  const noteHtml = d.manualColor
+    ? `<span class="qnote warn">This site hides its image data, so the color can't be read — pick it below.</span>`
+    : notes.length ? `<span class="qnote">${notes.join(' · ')}</span>` :
     `<span class="qnote warn">Shot on a busy background — color read from the center. A white surface reads truer.</span>`;
+  const colorPicker = d.manualColor
+    ? `<select class="input" data-d-colorsel="${d.id}" aria-label="Color">${d.options.map((o, i) => `<option value="${i}" ${i === d.colorIdx ? 'selected' : ''}>${o.name}</option>`).join('')}</select>`
+    : d.options.map((o, i) => `<button class="sw-opt ${i === d.colorIdx ? 'sel' : ''}" data-d-id="${d.id}" data-d-color="${i}"><span class="swatch" style="background:${o.hex}"></span>${esc(o.name)}${i === d.colorIdx ? ' ✓' : ''}</button>`).join('');
   return `
     <div class="review-row">
       <div class="review-thumb"><img src="${d.img}" alt=""></div>
       <div class="review-fields">
         <div class="row">${noteHtml}</div>
-        <div class="row">
-          ${d.options.map((o, i) => `<button class="sw-opt ${i === d.colorIdx ? 'sel' : ''}" data-d-id="${d.id}" data-d-color="${i}"><span class="swatch" style="background:${o.hex}"></span>${esc(o.name)}${i === d.colorIdx ? ' ✓' : ''}</button>`).join('')}
-        </div>
+        <div class="row">${colorPicker}</div>
         <div class="row">
           <input class="input" style="max-width:240px" value="${esc(d.name)}" data-d-name="${d.id}" aria-label="Item name">
           <select class="input" data-d-cat="${d.id}" aria-label="Category">
