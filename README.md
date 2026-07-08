@@ -37,6 +37,24 @@ plain HTML/CSS/JS modules. All data stays on the device in IndexedDB.
 - **Home** — morning card: set your city once, get tomorrow's weather-matched
   outfit. First run offers a 14-item demo closet.
 
+- **Sync across devices** — make up a closet code on the Home page; enter the
+  same code on any device and your closet appears there. Changes auto-sync.
+  Only a SHA-256 hash of the code leaves the device.
+
+## One-time setup for sync (Cloudflare dashboard)
+
+Sync needs a KV namespace bound to the Pages project (2 minutes, one time):
+
+1. Dashboard → **Storage & databases → KV** → Create namespace, name it
+   `styleme-sync`.
+2. Your Pages project (**styleme**) → **Settings → Bindings** → Add →
+   **KV namespace** → variable name `STYLEME_KV` → select `styleme-sync` →
+   Save.
+3. Redeploy (Deployments → ⋯ → Retry, or just wait for the next git push).
+
+Until then the app works normally; the sync card just reports that the
+server isn't set up yet.
+
 ## Run locally
 
 Serve this folder over HTTP (ES modules don't run from file://). Any static

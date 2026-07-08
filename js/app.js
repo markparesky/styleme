@@ -1,4 +1,5 @@
-import { putRecord, deleteRecord, getAllRecords, getSetting, setSetting, uid } from './db.js';
+import { putRecord, deleteRecord, getAllRecords, getSetting, setSetting, uid, clearStore } from './db.js';
+import { pullCloud, pushCloud } from './sync.js';
 import { analyzeImage, fileToDataUrl, NAMED_COLORS, metaForColorName } from './color.js';
 import { CATEGORIES, garmentDataUrl } from './garments.js';
 import { OCCASIONS, DRESS_CODES, DRESS_LABELS, targetFromText, generateOutfits, swapAlternatives, capsulePlan, ACTIVITIES } from './stylist.js';
@@ -13,7 +14,42 @@ const S = {
   stylist: { chip: null, text: '', results: [], shown: new Set(), title: '' },
   pack: { result: null, form: { dest: '', start: '', days: 5, work: 2, dinners: 1, acts: {}, themes: '', bag: 'carryon', laundry: 0 } },
   homeCity: null,
+  syncCode: null,
 };
+
+// ---------- cloud sync ----------
+let syncTimer = null;
+function dirty() {
+  if (!S.syncCode) return;
+  clearTimeout(syncTimer);
+  syncTimer = setTimeout(pushNow, 4000);
+}
+async function pushNow() {
+  if (!S.syncCode) return;
+  const payload = { items: S.items, wears: S.wears, homeCity: S.homeCity, updatedAt: Date.now() };
+  const r = await pushCloud(S.syncCode, payload);
+  if (r.ok) await setSetting('lastSyncAt', payload.updatedAt);
+  else if (r.unconfigured) toast('Sync isn’t set up on the server yet — see the README (KV binding).');
+  else if (r.error) toast('Sync failed: ' + r.error);
+}
+async function adoptCloud(data) {
+  await clearStore('items'); await clearStore('wears');
+  S.items = data.items || []; S.wears = data.wears || [];
+  for (const i of S.items) await putRecord('items', i);
+  for (const w of S.wears) await putRecord('wears', w);
+  if (data.homeCity) { S.homeCity = data.homeCity; await setSetting('homeCity', data.homeCity); }
+  await setSetting('lastSyncAt', data.updatedAt || Date.now());
+}
+async function pullOnBoot() {
+  const r = await pullCloud(S.syncCode);
+  if (!r.data) return;
+  const last = (await getSetting('lastSyncAt')) || 0;
+  if ((r.data.updatedAt || 0) > last) {
+    await adoptCloud(r.data);
+    toast('Closet updated from your other device');
+    render();
+  }
+}
 
 const $view = document.getElementById('view');
 const $modal = document.getElementById('modal-root');
@@ -105,6 +141,7 @@ async function viewHome() {
       for (const it of items) await putRecord('items', it);
       S.items.push(...items);
       toast('Demo closet loaded — 14 items');
+      dirty();
       nav('closet');
     });
     bindInlineNav();
@@ -119,9 +156,61 @@ async function viewHome() {
       <button class="btn primary" data-nav-inline="stylist">Style me</button>
       <button class="btn line" data-nav-inline="add">Add items</button>
     </div>
-    <div class="morning" id="morning"></div>`;
+    <div class="morning" id="morning"></div>
+    <div class="morning" id="synccard"></div>`;
   bindInlineNav();
   renderMorningCard();
+  renderSyncCard();
+}
+
+function renderSyncCard() {
+  const box = document.getElementById('synccard');
+  if (!box) return;
+  if (S.syncCode) {
+    box.innerHTML = `
+      <div class="card" style="max-width:640px">
+        <h3>Sync is on</h3>
+        <p class="muted" style="margin:8px 0 12px">Enter the same closet code on any device to open this closet there. Changes sync automatically.</p>
+        <div style="display:flex;gap:10px;flex-wrap:wrap">
+          <button class="btn line" id="sync-push">Sync now</button>
+          <button class="btn quiet" id="sync-off">Turn off on this device</button>
+        </div>
+      </div>`;
+    document.getElementById('sync-push').addEventListener('click', async () => { await pushNow(); toast('Synced'); });
+    document.getElementById('sync-off').addEventListener('click', async () => {
+      S.syncCode = null; await setSetting('syncCode', null); renderSyncCard();
+    });
+    return;
+  }
+  box.innerHTML = `
+    <div class="card" style="max-width:640px">
+      <h3>Your closet on every device</h3>
+      <p class="muted" style="margin:8px 0 12px">Make up a closet code (like a password — at least 6 characters) and enter it here. Enter the same code on your phone or laptop and your closet appears there. Only a scrambled version of the code ever leaves this device.</p>
+      <div style="display:flex;gap:10px;flex-wrap:wrap">
+        <input class="input" id="sync-code-in" type="password" placeholder="Your closet code" style="max-width:260px" autocomplete="off">
+        <button class="btn primary" id="sync-on">Turn on sync</button>
+      </div>
+    </div>`;
+  document.getElementById('sync-on').addEventListener('click', async () => {
+    const code = document.getElementById('sync-code-in').value.trim();
+    if (code.length < 6) { toast('Use at least 6 characters.'); return; }
+    const r = await pullCloud(code);
+    if (r.unconfigured) { toast('Sync isn’t set up on the server yet — see the README (KV binding).'); return; }
+    if (r.error) { toast('Could not reach sync: ' + r.error); return; }
+    S.syncCode = code;
+    await setSetting('syncCode', code);
+    if (r.data && (r.data.items || []).length && S.items.length &&
+        !window.confirm('A closet already exists under this code.\n\nOK = load it here (replaces this device’s closet)\nCancel = keep this device’s closet and overwrite the cloud copy')) {
+      await pushNow();
+    } else if (r.data && (r.data.items || []).length) {
+      await adoptCloud(r.data);
+      toast('Closet loaded from the cloud');
+    } else {
+      await pushNow();
+      toast('Sync is on — use this code on your other devices');
+    }
+    render();
+  });
 }
 
 async function renderMorningCard() {
@@ -145,6 +234,7 @@ async function renderMorningCard() {
         S.homeCity = c;
         await setSetting('homeCity', c);
         toast(`Home set to ${c.name}`);
+        dirty();
         renderMorningCard();
       } catch (err) { toast(err.message); }
     });
@@ -391,21 +481,19 @@ async function handleUrl() {
     const dataUrl = await new Promise((ok, no) => { const r = new FileReader(); r.onload = () => ok(r.result); r.onerror = no; r.readAsDataURL(blob); });
     try {
       const a = await analyzeImage(dataUrl);
+      document.getElementById('url-in').value = '';
+      if (scraped && scraped.colors && scraped.colors.length > 1) {
+        // The product comes in several colorways — ask which ones Mark owns
+        openColorwayModal(scraped, a);
+        return;
+      }
       addDraft(a);
       const d = S.drafts[S.drafts.length - 1];
       if (scraped) {
         if (scraped.title) d.name = scraped.title;
-        // The retailer's own declared color outranks our pixel guess
-        if (scraped.color) {
-          const declared = NAMED_COLORS.find(c => scraped.color.toLowerCase().includes(c.name.toLowerCase()));
-          if (declared && !d.options.some(o => o.name === declared.name)) {
-            d.options = [declared, ...d.options].slice(0, 3);
-          }
-          if (declared) d.colorIdx = d.options.findIndex(o => o.name === declared.name);
-        }
+        applyDeclaredColor(d, scraped.color);
       }
       renderDrafts();
-      document.getElementById('url-in').value = '';
       toast(scraped && scraped.title ? `Found "${scraped.title}"` : 'Image added — review below.');
       return;
     } catch { /* unreadable image data — fall through */ }
@@ -440,6 +528,54 @@ async function handleUrl() {
   renderDrafts();
   document.getElementById('url-in').value = '';
   toast('Image added — this site hides its colors from us, so pick the color below.');
+}
+
+// A retailer-declared color name ("Heather Navy") outranks the pixel guess
+function applyDeclaredColor(d, declaredName) {
+  if (!declaredName) return;
+  const named = NAMED_COLORS.find(c =>
+    declaredName.toLowerCase().includes(c.name.toLowerCase()) || c.name.toLowerCase() === declaredName.toLowerCase());
+  if (named) {
+    if (!d.options.some(o => o.name === named.name)) d.options = [named, ...d.options].slice(0, 3);
+    d.colorIdx = d.options.findIndex(o => o.name === named.name);
+  } else {
+    // unknown label — keep it visible in the name, let the swatch be the guess
+    if (!d.name.toLowerCase().includes(declaredName.toLowerCase())) d.name += ` — ${declaredName}`;
+  }
+}
+
+// "Which colors do you have?" — one closet item per selected colorway
+function openColorwayModal(scraped, analysis) {
+  $modal.innerHTML = `
+    <div class="modal-back" id="cwback">
+      <div class="modal" role="dialog" aria-label="Choose your colors">
+        <h2>Which colors do you have?</h2>
+        <p class="muted" style="margin:6px 0 14px">${esc(scraped.title || 'This item')} comes in ${scraped.colors.length} colors. Select every one you own — each becomes its own closet item.</p>
+        <div style="display:flex;flex-direction:column;gap:8px;max-height:44vh;overflow-y:auto">
+          ${scraped.colors.map((c, i) => `<label style="display:flex;gap:10px;align-items:center;font-size:14.5px"><input type="checkbox" data-cw="${i}" ${scraped.colors.length === 1 || (scraped.color && c === scraped.color) ? 'checked' : ''}> ${esc(c)}</label>`).join('')}
+        </div>
+        <div style="display:flex;gap:10px;margin-top:20px">
+          <button class="btn primary" id="cw-add">Add selected</button>
+          <button class="btn quiet" id="cw-cancel">Cancel</button>
+        </div>
+      </div>
+    </div>`;
+  const close = () => { $modal.innerHTML = ''; };
+  document.getElementById('cwback').addEventListener('click', e => { if (e.target.id === 'cwback') close(); });
+  document.getElementById('cw-cancel').addEventListener('click', close);
+  document.getElementById('cw-add').addEventListener('click', () => {
+    const picked = [...document.querySelectorAll('[data-cw]:checked')].map(cb => scraped.colors[+cb.dataset.cw]);
+    if (!picked.length) { toast('Select at least one color.'); return; }
+    for (const label of picked) {
+      addDraft(analysis);
+      const d = S.drafts[S.drafts.length - 1];
+      if (scraped.title) d.name = scraped.title;
+      applyDeclaredColor(d, label);
+    }
+    close();
+    renderDrafts();
+    toast(`${picked.length} colorway${picked.length > 1 ? 's' : ''} added — review below.`);
+  });
 }
 
 function addDraft(a) {
@@ -515,6 +651,13 @@ function renderDrafts() {
     S.drafts = S.drafts.filter(x => x.id !== b.dataset.dDel);
     renderDrafts();
   }));
+  box.querySelectorAll('[data-d-dup]').forEach(b => b.addEventListener('click', () => {
+    const d = S.drafts.find(x => x.id === b.dataset.dDup);
+    const idx = S.drafts.indexOf(d);
+    // duplicate with a free-choice color picker — you own it in another color
+    S.drafts.splice(idx + 1, 0, { ...d, id: uid(), manualColor: true, options: NAMED_COLORS, colorIdx: 0 });
+    renderDrafts();
+  }));
   document.getElementById('add-all').addEventListener('click', async () => {
     for (const d of S.drafts) {
       const c = d.options[d.colorIdx];
@@ -532,6 +675,7 @@ function renderDrafts() {
     const added = S.drafts.length;
     S.drafts = [];
     toast(`${added} item${added > 1 ? 's' : ''} added to your closet`);
+    dirty();
     nav('closet');
   });
   document.getElementById('clear-drafts').addEventListener('click', () => { S.drafts = []; renderDrafts(); });
@@ -560,6 +704,7 @@ function draftRowHtml(d) {
           <select class="input" data-d-cat="${d.id}" aria-label="Category">
             ${CATEGORIES.map(c => `<option value="${c.id}" ${c.id === d.category ? 'selected' : ''}>${c.label}</option>`).join('')}
           </select>
+          <button class="btn quiet" data-d-dup="${d.id}" title="I have this in another color too">＋ Another color</button>
           <button class="btn quiet" data-d-del="${d.id}">Remove</button>
         </div>
         <div class="row" style="max-width:380px;flex:1">
@@ -657,12 +802,12 @@ function openItemModal(id) {
     item.laundry = document.getElementById('mi-laundry').checked;
     if (colorChanged && item.imgKind === 'silhouette') item.img = garmentDataUrl(item.category, c.hex, item.name);
     await putRecord('items', item);
-    close(); toast('Saved'); render();
+    close(); toast('Saved'); render(); dirty();
   });
   document.getElementById('mi-del').addEventListener('click', async () => {
     await deleteRecord('items', item.id);
     S.items = S.items.filter(i => i.id !== item.id);
-    close(); toast('Item deleted'); render();
+    close(); toast('Item deleted'); render(); dirty();
   });
 }
 
@@ -825,6 +970,7 @@ function openMirrorModal(itemIds, occasion) {
     }
     close();
     toast('Logged to Lookbook — have a great one');
+    dirty();
   });
 }
 
@@ -838,6 +984,7 @@ function viewLookbook() {
   $view.querySelectorAll('[data-del-wear]').forEach(b => b.addEventListener('click', async () => {
     await deleteRecord('wears', b.dataset.delWear);
     S.wears = S.wears.filter(w => w.id !== b.dataset.delWear);
+    dirty();
     viewLookbook();
   }));
 }
@@ -992,7 +1139,9 @@ async function boot() {
   S.items = await getAllRecords('items');
   S.wears = await getAllRecords('wears');
   S.homeCity = await getSetting('homeCity');
+  S.syncCode = await getSetting('syncCode');
   S.route = location.hash.replace('#/', '') || 'home';
   render();
+  if (S.syncCode) pullOnBoot();
 }
 boot();

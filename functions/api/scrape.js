@@ -29,11 +29,15 @@ export async function onRequestGet({ request }) {
         if (p) {
           const image = (p.images && p.images[0] && p.images[0].src) || (p.image && p.image.src) || null;
           let color = null;
+          let colors = null;
           if (Array.isArray(p.options)) {
             const oi = p.options.findIndex(o => /colou?r/i.test(o.name || ''));
-            if (oi >= 0 && p.variants && p.variants[0]) color = p.variants[0]['option' + (oi + 1)] || null;
+            if (oi >= 0 && Array.isArray(p.variants)) {
+              colors = [...new Set(p.variants.map(v => v['option' + (oi + 1)]).filter(Boolean))];
+              color = colors[0] || null;
+            }
           }
-          if (image) return json({ image, title: p.title || null, color });
+          if (image) return json({ image, title: p.title || null, color, colors });
         }
       }
     }
@@ -95,5 +99,5 @@ export async function onRequestGet({ request }) {
   if (title) title = title.split(/\s*[|•]\s*/)[0].trim().slice(0, 80);
 
   if (!image) return json({ error: 'No product image found on that page.' }, 404);
-  return json({ image, title, color });
+  return json({ image, title, color, colors: color ? [color] : null });
 }

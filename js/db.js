@@ -57,6 +57,10 @@ export async function setSetting(key, value) {
   await putRecord('settings', { key, value });
 }
 
+export async function clearStore(store) {
+  await tx(store, 'readwrite', s => s.clear());
+}
+
 export function uid() {
   return Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
 }
