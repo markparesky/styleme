@@ -10,6 +10,10 @@ function json(obj, status = 200) {
   });
 }
 
+function withTimeout(promise, ms) {
+  return Promise.race([promise, new Promise((_, rej) => setTimeout(() => rej(new Error('AI timeout')), ms))]);
+}
+
 async function aiReview(env, look) {
   if (!env.AI) return null;
   try {
@@ -25,9 +29,9 @@ async function aiReview(env, look) {
       `"items": [{"id": "<id>", "verdict": "love"|"ok"|"no", "comment": "max 80 chars"}]}`;
     let res;
     try {
-      res = await env.AI.run('@cf/meta/llama-3.2-11b-vision-instruct', { prompt, image: [...bytes] });
+      res = await withTimeout(env.AI.run('@cf/meta/llama-3.2-11b-vision-instruct', { prompt, image: [...bytes] }), 30000);
     } catch {
-      res = await env.AI.run('@cf/llava-hf/llava-1.5-7b-hf', { prompt, image: [...bytes] });
+      res = await withTimeout(env.AI.run('@cf/llava-hf/llava-1.5-7b-hf', { prompt, image: [...bytes], max_tokens: 512 }), 30000);
     }
     const text = res.response || res.description || '';
     const m = text.match(/\{[\s\S]*\}/);
@@ -48,8 +52,28 @@ async function aiReview(env, look) {
   } catch { return null; }
 }
 
-// POST { id, look } → { ok, aiReview } (owner posts a look for rating)
-export async function onRequestPost({ request, env }) {
+// The AI review must never block or sink the post: it runs after the
+// response is sent (waitUntil) and attaches to the stored look when done.
+async function reviewInBackground(env, key, lookId) {
+  try {
+    let list = JSON.parse((await env.STYLEME_KV.get(key)) || '[]');
+    const look = list.find(l => l.id === lookId);
+    if (!look) return;
+    const review = await aiReview(env, look);
+    if (!review) return;
+    // re-read: a human rating may have landed while the AI was thinking
+    list = JSON.parse((await env.STYLEME_KV.get(key)) || '[]');
+    const fresh = list.find(l => l.id === lookId);
+    if (!fresh) return;
+    fresh.ratings = (fresh.ratings || []).filter(r => !r.ai);
+    fresh.ratings.unshift(review);
+    await env.STYLEME_KV.put(key, JSON.stringify(list));
+  } catch { /* best effort */ }
+}
+
+// POST { id, look } → { ok, lookId } (owner posts a look for rating)
+export async function onRequestPost(context) {
+  const { request, env } = context;
   if (!env.STYLEME_KV) return json({ error: 'Sync is not set up on the server yet.' }, 501);
   let body;
   try { body = await request.json(); } catch { return json({ error: 'Bad request.' }, 400); }
@@ -69,11 +93,10 @@ export async function onRequestPost({ request, env }) {
     occasion: String(look.occasion || '').slice(0, 80),
     ratings: [],
   };
-  const review = await aiReview(env, entry);
-  if (review) entry.ratings.push(review);
   list.unshift(entry);
   await env.STYLEME_KV.put(key, JSON.stringify(list.slice(0, 20)));
-  return json({ ok: true, lookId: entry.id, aiReview: review });
+  if (env.AI) context.waitUntil(reviewInBackground(env, key, entry.id));
+  return json({ ok: true, lookId: entry.id, aiPending: !!env.AI });
 }
 
 // GET ?id=…  (owner)  |  GET ?token=…  (reviewer)

@@ -1507,8 +1507,8 @@ function openMirrorModal(itemIds, occasion) {
       if (res.ok) {
         wear.lookId = res.lookId;
         const token = await ensureShareToken();
-        if (res.aiReview) {
-          setTimeout(() => toast(`AI: ${'♥'.repeat(res.aiReview.outfit)} — “${res.aiReview.comment}”`), 3000);
+        if (res.aiPending) {
+          setTimeout(() => toast('The AI is reviewing your look — its verdict lands in the Lookbook shortly.'), 3000);
         }
         if (token) {
           const url = `${location.origin}/#/rate/${token}`;
