@@ -191,11 +191,13 @@ async function viewHome() {
         <p class="muted" style="margin:10px 0 4px">Add your clothes with photos — colors are read automatically and corrected for bad lighting. Or try everything instantly with a demo closet.</p>
         <div class="hero-cta">
           <button class="btn primary" data-nav-inline="add">Add my clothes</button>
+          <button class="btn line" id="snap-look">📷 Snap what I'm wearing</button>
           <button class="btn line" id="seed-demo">Load demo closet (14 items)</button>
         </div>
       </div>
       <div class="morning" id="synccard"></div>`;
     renderSyncCard();
+    document.getElementById('snap-look').addEventListener('click', snapLook);
     document.getElementById('seed-demo').addEventListener('click', async () => {
       const items = demoItems();
       for (const it of items) await putRecord('items', it);
@@ -214,13 +216,136 @@ async function viewHome() {
     <p class="statline">You have <b>${n} item${n === 1 ? '' : 's'}</b> in your closet · <b>${S.wears.length}</b> look${S.wears.length === 1 ? '' : 's'} in your Lookbook${wearsThisWeek ? ` · <b>${wearsThisWeek}</b> worn this week` : ''}.</p>
     <div class="hero-cta">
       <button class="btn primary" data-nav-inline="stylist">Style me</button>
+      <button class="btn line" id="snap-look">📷 Snap today's look</button>
       <button class="btn line" data-nav-inline="add">Add items</button>
     </div>
     <div class="morning" id="morning"></div>
     <div class="morning" id="synccard"></div>`;
   bindInlineNav();
+  document.getElementById('snap-look').addEventListener('click', snapLook);
   renderMorningCard();
   renderSyncCard();
+}
+
+// ============================================================ SNAP A LOOK
+// Photograph what you're wearing → AI identifies the pieces → match to the
+// closet (or add what's missing) → straight into the mirror check.
+function snapLook() {
+  let input = document.getElementById('snap-in');
+  if (!input) {
+    input = document.createElement('input');
+    input.type = 'file'; input.accept = 'image/*'; input.id = 'snap-in'; input.hidden = true;
+    input.setAttribute('capture', 'user');
+    document.body.appendChild(input);
+    input.addEventListener('change', async e => {
+      const f = e.target.files[0];
+      e.target.value = '';
+      if (f) await handleSnap(f);
+    });
+  }
+  input.click();
+}
+
+const AI_CAT_MAP = { shirt: 'top', top: 'top', tee: 'top', 't-shirt': 'top', blouse: 'top', polo: 'top', sweater: 'layer', hoodie: 'layer', jacket: 'layer', coat: 'layer', blazer: 'layer', cardigan: 'layer', overshirt: 'layer', pants: 'bottom', jeans: 'bottom', trousers: 'bottom', shorts: 'bottom', chinos: 'bottom', skirt: 'bottom', dress: 'dress', shoes: 'shoes', sneakers: 'shoes', loafers: 'shoes', boots: 'shoes', sandals: 'shoes', heels: 'shoes' };
+
+function matchGarment(g) {
+  const catRaw = (g.category || '').toLowerCase();
+  const nameRaw = (g.name || '').toLowerCase();
+  let cat = AI_CAT_MAP[catRaw] || null;
+  if (!cat) for (const k of Object.keys(AI_CAT_MAP)) if (catRaw.includes(k) || nameRaw.includes(k)) { cat = AI_CAT_MAP[k]; break; }
+  if (!cat) cat = 'top';
+  const colorNamed = NAMED_COLORS.find(c => (g.color || '').toLowerCase().includes(c.name.toLowerCase()));
+  let best = null;
+  for (const item of S.items) {
+    if (item.category !== cat) continue;
+    let score = 0;
+    if (colorNamed && item.colors[0].name === colorNamed.name) score += 2;
+    else if (colorNamed && metaForColorName(item.colors[0].name).tone === colorNamed.tone) score += 0.5;
+    for (const word of nameRaw.split(/\s+/)) {
+      if (word.length > 3 && item.name.toLowerCase().includes(word)) score += 1;
+    }
+    if (!best || score > best.score) best = { item, score };
+  }
+  return { cat, colorNamed, match: best && best.score >= 2 ? best.item : null };
+}
+
+async function handleSnap(file) {
+  toast('Reading your look…');
+  const photo = await downscalePhoto(await fileToDataUrl(file));
+  let garments = [];
+  let aiTried = false;
+  try {
+    const res = await fetch('/api/identify', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ photo }) });
+    aiTried = true;
+    if (res.ok) garments = (await res.json()).garments || [];
+  } catch { /* offline or local — manual picker below */ }
+  openSnapModal(photo, garments, aiTried);
+}
+
+function openSnapModal(photo, garments, aiTried) {
+  const rows = garments.map(g => ({ g, ...matchGarment(g) }));
+  const catItems = cat => S.items.filter(i => i.category === cat);
+  $modal.innerHTML = `
+    <div class="modal-back" id="snback">
+      <div class="modal" role="dialog" aria-label="Snap a look">
+        <h2>Today's look</h2>
+        <div style="text-align:center;margin:10px 0"><img src="${photo}" alt="Your look" style="max-height:32vh;border-radius:12px"></div>
+        ${rows.length ? `<p class="muted" style="margin-bottom:10px">Here's what I can see — check the matches:</p>` : `<p class="muted" style="margin-bottom:10px">${aiTried ? 'Couldn’t identify the pieces from the photo — ' : ''}Pick what you're wearing:</p>`}
+        ${rows.length ? rows.map((r, i) => `
+          <div class="field" style="margin-bottom:12px">
+            <label class="lab">${esc(r.g.name)}${r.g.color ? ` · ${esc(r.g.color)}` : ''}</label>
+            <select class="input" data-sn-sel="${i}" style="width:100%">
+              ${catItems(r.cat).map(it => `<option value="${it.id}" ${r.match && r.match.id === it.id ? 'selected' : ''}>${esc(it.name)}</option>`).join('')}
+              <option value="__new__" ${!r.match ? 'selected' : ''}>＋ Not in my closet — add "${esc(r.g.name)}"</option>
+              <option value="__skip__">Skip this piece</option>
+            </select>
+          </div>`).join('')
+        : `<div style="max-height:34vh;overflow-y:auto">${CATEGORIES.map(cat => {
+            const inCat = catItems(cat.id);
+            if (!inCat.length) return '';
+            return `<label class="lab" style="margin-top:10px">${cat.label}s</label>` + inCat.map(it =>
+              `<label style="display:flex;gap:8px;align-items:center;font-size:13.5px;padding:3px 0"><input type="checkbox" data-sn-chk="${it.id}"> ${esc(it.name)}</label>`).join('');
+          }).join('')}</div>`}
+        <div style="display:flex;gap:10px;margin-top:16px;flex-wrap:wrap">
+          <button class="btn primary" id="sn-go">Continue → Mirror check</button>
+          <button class="btn quiet" id="sn-cancel">Cancel</button>
+        </div>
+      </div>
+    </div>`;
+  const close = () => { $modal.innerHTML = ''; };
+  document.getElementById('snback').addEventListener('click', e => { if (e.target.id === 'snback') close(); });
+  document.getElementById('sn-cancel').addEventListener('click', close);
+  document.getElementById('sn-go').addEventListener('click', async () => {
+    const ids = [];
+    if (rows.length) {
+      for (let i = 0; i < rows.length; i++) {
+        const val = document.querySelector(`[data-sn-sel="${i}"]`).value;
+        if (val === '__skip__') continue;
+        if (val === '__new__') {
+          const r = rows[i];
+          const c = r.colorNamed || metaForColorName('Grey');
+          const item = {
+            id: uid(), name: r.g.name, category: r.cat,
+            colors: [{ name: c.name, hex: c.hex }], dressiness: 3,
+            img: garmentDataUrl(r.cat, c.hex, r.g.name), imgKind: 'silhouette',
+            laundry: false, wearCount: 0, lastWorn: null, createdAt: Date.now(),
+          };
+          await putRecord('items', item);
+          S.items.push(item);
+          ids.push(item.id);
+        } else ids.push(val);
+      }
+      if (rows.some((r, i) => document.querySelector(`[data-sn-sel="${i}"]`).value === '__new__')) {
+        toast('New pieces added — give them real photos later from My Closet');
+        dirty();
+      }
+    } else {
+      document.querySelectorAll('[data-sn-chk]:checked').forEach(cb => ids.push(cb.dataset.snChk));
+    }
+    if (!ids.length) { toast('Pick at least one piece.'); return; }
+    close();
+    openMirrorModal(ids, '', photo);
+  });
 }
 
 function bindBackupButtons() {
@@ -1431,10 +1556,10 @@ function bindWearButtons() {
 
 const WEAR_OCCASIONS = ['Work', 'Restaurant dinner', 'Dinner party', 'Theme party', 'Wedding', 'Boating', 'Daytime weekend', 'Night out', 'Travel', 'Workout'];
 
-function openMirrorModal(itemIds, occasion) {
+function openMirrorModal(itemIds, occasion, presetPhoto = null) {
   const items = itemIds.map(id => S.items.find(i => i.id === id)).filter(Boolean);
   let rating = 0;
-  let photoData = null;
+  let photoData = presetPhoto;
   let pickedOccasion = occasion || '';
   $modal.innerHTML = `
     <div class="modal-back" id="wback">
@@ -1442,9 +1567,9 @@ function openMirrorModal(itemIds, occasion) {
         <h2>Mirror check</h2>
         <p class="muted" style="margin-bottom:14px">One snap before you head out — it logs the wear, files the look, and teaches the stylist.</p>
         <div class="field">
-          <button class="btn line" id="w-photo-btn">📷 Add a mirror photo (optional)</button>
+          <button class="btn line" id="w-photo-btn">📷 ${presetPhoto ? 'Retake the photo' : 'Add a mirror photo (optional)'}</button>
           <input type="file" id="w-photo" accept="image/*" capture="user" hidden>
-          <div id="w-photo-note" class="muted" style="font-size:13px;margin-top:6px"></div>
+          <div id="w-photo-note" class="muted" style="font-size:13px;margin-top:6px">${presetPhoto ? 'Photo attached ✓ — saved to your Lookbook with this outfit.' : ''}</div>
         </div>
         <div class="wear-items">
           ${items.map(i => `
@@ -1461,7 +1586,7 @@ function openMirrorModal(itemIds, occasion) {
         <div class="field"><label class="lab">How did it feel?</label>
           <div class="hearts-input" id="w-hearts">${[1, 2, 3, 4, 5].map(n => `<button data-h="${n}" aria-label="${n} hearts">♥</button>`).join('')}</div>
         </div>
-        ${S.syncCode ? `<div class="field" id="w-rate-row" style="display:none">
+        ${S.syncCode ? `<div class="field" id="w-rate-row" style="display:${presetPhoto ? 'block' : 'none'}">
           <label style="display:flex;gap:8px;align-items:center;font-size:14px"><input type="checkbox" id="w-ask" checked> Ask for ratings — AI reviews it now, and you get a link to text your people</label>
         </div>` : ''}
         <div style="display:flex;gap:10px;flex-wrap:wrap">

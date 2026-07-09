@@ -14,6 +14,14 @@ function withTimeout(promise, ms) {
   return Promise.race([promise, new Promise((_, rej) => setTimeout(() => rej(new Error('AI timeout')), ms))]);
 }
 
+// cut overlong model output at the last full sentence instead of mid-word
+function trimAtSentence(s, max) {
+  if (s.length <= max) return s;
+  const cut = s.slice(0, max);
+  const p = cut.lastIndexOf('. ');
+  return p > max * 0.4 ? cut.slice(0, p + 1) : cut;
+}
+
 async function aiReview(env, look) {
   if (!env.AI) return null;
   try {
@@ -37,16 +45,21 @@ async function aiReview(env, look) {
     const m = text.match(/\{[\s\S]*\}/);
     if (!m) return null;
     const j = JSON.parse(m[0]);
+    const ids = look.items.map(i => i.id);
     const items = {};
     const itemComments = {};
-    for (const x of (j.items || [])) {
-      if (x && x.id && ['love', 'ok', 'no'].includes(x.verdict)) items[x.id] = x.verdict;
-      if (x && x.id && x.comment) itemComments[x.id] = String(x.comment).slice(0, 100);
-    }
+    (j.items || []).forEach((x, idx) => {
+      if (!x) return;
+      let key = String(x.id || '');
+      if (!ids.includes(key)) key = ids[idx]; // models often answer with 1,2,3 — map by order
+      if (!key) return;
+      if (['love', 'ok', 'no'].includes(x.verdict)) items[key] = x.verdict;
+      if (x.comment) itemComments[key] = trimAtSentence(String(x.comment), 100);
+    });
     return {
       by: 'StyleMe AI', ai: true, at: Date.now(),
       outfit: Math.max(1, Math.min(5, Number(j.outfit) || 3)),
-      comment: String(j.comment || '').slice(0, 200),
+      comment: trimAtSentence(String(j.comment || ''), 220),
       items, itemComments, tags: {},
     };
   } catch { return null; }
