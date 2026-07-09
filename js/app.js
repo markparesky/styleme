@@ -1215,7 +1215,12 @@ function openItemModal(id, onClose = null) {
     <div class="modal-back" id="mback">
       <div class="modal" role="dialog" aria-label="Item details">
         <div style="display:flex;gap:20px;flex-wrap:wrap">
-          <div class="review-thumb" style="width:150px;height:150px"><img src="${itemImg(item)}" alt=""></div>
+          <div>
+            <div class="review-thumb" style="width:150px;height:150px"><img id="mi-img" src="${itemImg(item)}" alt=""></div>
+            <button class="btn quiet" id="mi-photo-btn" style="font-size:12px;padding:6px 0">📷 ${item.imgKind === 'silhouette' ? 'Add a real photo' : 'Replace photo'}</button>
+            <input type="file" id="mi-photo" accept="image/*" hidden>
+            <div id="mi-photo-note" class="muted" style="font-size:11.5px;max-width:150px"></div>
+          </div>
           <div style="flex:1;min-width:220px">
             <div class="field"><label class="lab">Name</label><input class="input" id="mi-name" value="${esc(item.name)}"></div>
             <div class="field"><label class="lab">Color</label>
@@ -1243,6 +1248,37 @@ function openItemModal(id, onClose = null) {
   const close = () => { $modal.innerHTML = ''; if (onClose) onClose(); };
   document.getElementById('mback').addEventListener('click', e => { if (e.target.id === 'mback') close(); });
   document.getElementById('mi-close').addEventListener('click', close);
+  let newImg = null; // { dataUrl, kind } pending until Save
+  document.getElementById('mi-photo-btn').addEventListener('click', () => document.getElementById('mi-photo').click());
+  document.getElementById('mi-photo').addEventListener('change', async e => {
+    const f = e.target.files[0];
+    e.target.value = '';
+    if (!f) return;
+    document.getElementById('mi-photo-note').textContent = 'Reading the photo…';
+    try {
+      const a = await analyzeImage(await fileToDataUrl(f));
+      newImg = { dataUrl: a.dataUrl, kind: a.cutout ? 'cutout' : 'photo' };
+      document.getElementById('mi-img').src = a.dataUrl;
+      const notes = [];
+      if (a.corrected) notes.push('cast corrected');
+      if (a.cutout) notes.push('background cut out');
+      const detected = a.named[0];
+      const current = document.getElementById('mi-color').value;
+      let html = notes.length ? notes.join(' · ') + '. ' : '';
+      if (detected && detected.name !== current) {
+        html += `Photo reads <b>${esc(detected.name)}</b> — <a href="#" id="mi-usecolor">use it</a>`;
+      }
+      document.getElementById('mi-photo-note').innerHTML = html || 'Photo updated — Save to keep it.';
+      const use = document.getElementById('mi-usecolor');
+      if (use) use.addEventListener('click', ev => {
+        ev.preventDefault();
+        document.getElementById('mi-color').value = detected.name;
+        document.getElementById('mi-photo-note').textContent = `Color set to ${detected.name} — Save to keep it.`;
+      });
+    } catch {
+      document.getElementById('mi-photo-note').textContent = 'Could not read that photo — try another.';
+    }
+  });
   document.getElementById('mi-dress').addEventListener('input', e => {
     document.getElementById('mi-dress-out').textContent = DRESS_LABELS[+e.target.value];
   });
@@ -1256,6 +1292,7 @@ function openItemModal(id, onClose = null) {
     item.brandColor = document.getElementById('mi-brandcolor').value.trim() || null;
     item.size = document.getElementById('mi-size').value.trim() || null;
     item.fitNote = document.getElementById('mi-fitnote').value.trim() || null;
+    if (newImg) { item.img = newImg.dataUrl; item.imgKind = newImg.kind; }
     if (colorChanged && item.imgKind === 'silhouette') item.img = garmentDataUrl(item.category, c.hex, item.name);
     await putRecord('items', item);
     close(); toast('Saved'); render(); dirty();
