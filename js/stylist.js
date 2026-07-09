@@ -45,8 +45,50 @@ function hueDelta(a, b) {
   return d > 180 ? 360 - d : d;
 }
 
+// Build a preference model from every feedback source: the owner's own
+// wear ratings, invited reviewers' verdicts, and the AI's review.
+// Returns { itemAff: {id: n}, pairAff: {'idA|idB': n} }
+export function computePrefs(looks = [], wears = []) {
+  const itemAff = {};
+  const pairAff = {};
+  const bump = (obj, key, n) => { obj[key] = (obj[key] || 0) + n; };
+  const pairKey = (a, b) => [a, b].sort().join('|');
+
+  for (const w of wears) {
+    if (!w.rating || !w.itemIds) continue;
+    const d = w.rating - 3; // own hearts: -2 … +2
+    for (const id of w.itemIds) bump(itemAff, id, d * 0.6);
+    for (let i = 0; i < w.itemIds.length; i++)
+      for (let j = i + 1; j < w.itemIds.length; j++)
+        bump(pairAff, pairKey(w.itemIds[i], w.itemIds[j]), d * 0.5);
+  }
+
+  for (const look of looks) {
+    const ids = (look.items || []).map(i => i.id);
+    for (const r of (look.ratings || [])) {
+      const w = r.ai ? 0.7 : 1; // humans outrank the AI
+      const d = (r.outfit || 3) - 3;
+      for (let i = 0; i < ids.length; i++)
+        for (let j = i + 1; j < ids.length; j++)
+          bump(pairAff, pairKey(ids[i], ids[j]), d * 0.5 * w);
+      for (const [id, verdict] of Object.entries(r.items || {})) {
+        bump(itemAff, id, (verdict === 'love' ? 2 : verdict === 'no' ? -2 : 0.3) * w);
+      }
+      for (const [id, tags] of Object.entries(r.tags || {})) {
+        if (tags.includes('Not with these')) {
+          for (const other of ids) if (other !== id) bump(pairAff, pairKey(id, other), -2 * w);
+        }
+        if (tags.includes('Too small') || tags.includes('Too big')) bump(itemAff, id, -1.5 * w);
+      }
+    }
+  }
+  return { itemAff, pairAff };
+}
+
+const clamp = (n, lim) => Math.max(-lim, Math.min(lim, n));
+
 // Score a set of items as one outfit. Returns { score, why, palette }
-export function scoreOutfit(items, target, recentPairs) {
+export function scoreOutfit(items, target, recentPairs, prefs = null) {
   const ms = items.map(meta);
   let score = 50;
   const why = [];
@@ -127,6 +169,18 @@ export function scoreOutfit(items, target, recentPairs) {
     why.push(`You wore this exact combination recently — swapped scoring against a repeat.`);
   }
 
+  // ---- learned taste: your hearts, your people's verdicts, the AI's review ----
+  if (prefs) {
+    let learned = 0;
+    for (const i of items) learned += clamp((prefs.itemAff[i.id] || 0) * 2.2, 12);
+    for (let a = 0; a < items.length; a++)
+      for (let b = a + 1; b < items.length; b++)
+        learned += clamp((prefs.pairAff[[items[a].id, items[b].id].sort().join('|')] || 0) * 2.5, 12);
+    score += clamp(learned, 30);
+    if (learned >= 8) why.push(`Your ratings say pieces like these work on you.`);
+    if (learned <= -8) why.push(`Fair warning: past ratings weren't kind to this mix.`);
+  }
+
   return { score, why, palette: ms };
 }
 
@@ -159,7 +213,7 @@ export function recentPairKeys(wears, days = 14) {
   return set;
 }
 
-export function generateOutfits(items, { target = 3, temp = null, wears = [], count = 3, exclude = new Set(), buildAroundId = null } = {}) {
+export function generateOutfits(items, { target = 3, temp = null, wears = [], count = 3, exclude = new Set(), buildAroundId = null, prefs = null } = {}) {
   const avail = items.filter(i => !i.laundry);
   const byCat = {};
   for (const i of avail) (byCat[i.category] = byCat[i.category] || []).push(i);
@@ -169,7 +223,7 @@ export function generateOutfits(items, { target = 3, temp = null, wears = [], co
     if (buildAroundId && !combo.some(i => i.id === buildAroundId)) continue;
     const key = combo.map(i => i.id).sort().join('|');
     if (exclude.has(key)) continue;
-    const s = scoreOutfit(combo, target, recent);
+    const s = scoreOutfit(combo, target, recent, prefs);
     scored.push({ items: combo, key, ...s });
   }
   scored.sort((a, b) => b.score - a.score);
@@ -188,7 +242,7 @@ export function generateOutfits(items, { target = 3, temp = null, wears = [], co
   return picked;
 }
 
-export function swapAlternatives(items, outfit, slotItemId, target, wears) {
+export function swapAlternatives(items, outfit, slotItemId, target, wears, prefs = null) {
   const slotItem = outfit.items.find(i => i.id === slotItemId);
   if (!slotItem) return [];
   const recent = recentPairKeys(wears);
@@ -196,7 +250,7 @@ export function swapAlternatives(items, outfit, slotItemId, target, wears) {
     .filter(i => i.category === slotItem.category && i.id !== slotItem.id && !i.laundry)
     .map(alt => {
       const combo = outfit.items.map(i => (i.id === slotItemId ? alt : i));
-      return { alt, ...scoreOutfit(combo, target, recent), items: combo };
+      return { alt, ...scoreOutfit(combo, target, recent, prefs), items: combo };
     })
     .sort((a, b) => b.score - a.score);
 }

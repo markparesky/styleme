@@ -1,8 +1,8 @@
 import { putRecord, deleteRecord, getAllRecords, getSetting, setSetting, uid, clearStore } from './db.js';
-import { pullCloud, pushCloud, createShareLink, fetchSharedCloset, sendSuggestion, fetchSuggestions, dismissSuggestion } from './sync.js';
+import { pullCloud, pushCloud, createShareLink, fetchSharedCloset, sendSuggestion, fetchSuggestions, dismissSuggestion, postLook, fetchLooksOwner, fetchLooksByToken, submitRating } from './sync.js';
 import { analyzeImage, fileToDataUrl, NAMED_COLORS, metaForColorName } from './color.js';
 import { CATEGORIES, garmentDataUrl } from './garments.js';
-import { OCCASIONS, DRESS_CODES, DRESS_LABELS, targetFromText, generateOutfits, swapAlternatives, capsulePlan, ACTIVITIES, scoreOutfit } from './stylist.js';
+import { OCCASIONS, DRESS_CODES, DRESS_LABELS, targetFromText, generateOutfits, swapAlternatives, capsulePlan, ACTIVITIES, scoreOutfit, computePrefs } from './stylist.js';
 import { geocode, forecast, describeWmo } from './weather.js';
 import { demoItems } from './demo.js';
 
@@ -15,7 +15,53 @@ const S = {
   pack: { result: null, form: { dest: '', start: '', days: 5, work: 2, dinners: 1, acts: {}, themes: '', bag: 'carryon', laundry: 0 } },
   homeCity: null,
   syncCode: null,
+  looks: [],
+  prefs: null,
 };
+
+// Learned taste: recompute whenever ratings arrive. Also auto-flag fit notes
+// from "too small/too big" tags so future sizing advice sticks to the item.
+async function refreshPrefs() {
+  if (S.syncCode) S.looks = await fetchLooksOwner(S.syncCode);
+  S.prefs = computePrefs(S.looks, S.wears);
+  for (const look of S.looks) {
+    for (const r of (look.ratings || [])) {
+      for (const [id, tags] of Object.entries(r.tags || {})) {
+        const item = S.items.find(i => i.id === id);
+        if (!item || item.fitNote) continue;
+        if (tags.includes('Too small')) { item.fitNote = `${r.by} says it runs small`; await putRecord('items', item); }
+        else if (tags.includes('Too big')) { item.fitNote = `${r.by} says it runs big`; await putRecord('items', item); }
+      }
+    }
+  }
+}
+
+// One stable share token per closet, reused for stylist + rating links
+async function ensureShareToken() {
+  let token = await getSetting('shareToken');
+  if (token) return token;
+  const r = await createShareLink(S.syncCode);
+  if (r.error) return null;
+  token = r.url.split('/stylist-for/')[1];
+  await setSetting('shareToken', token);
+  return token;
+}
+
+function downscalePhoto(dataUrl, maxDim = 900, quality = 0.72) {
+  return new Promise(resolve => {
+    const img = new Image();
+    img.onload = () => {
+      const scale = Math.min(1, maxDim / Math.max(img.width, img.height));
+      const c = document.createElement('canvas');
+      c.width = Math.round(img.width * scale);
+      c.height = Math.round(img.height * scale);
+      c.getContext('2d').drawImage(img, 0, 0, c.width, c.height);
+      resolve(c.toDataURL('image/jpeg', quality));
+    };
+    img.onerror = () => resolve(dataUrl);
+    img.src = dataUrl;
+  });
+}
 
 // ---------- cloud sync ----------
 let syncTimer = null;
@@ -112,6 +158,10 @@ function parseRoute() {
     S.shareToken = h.slice('stylist-for/'.length);
     return 'stylist-for';
   }
+  if (h.startsWith('rate/')) {
+    S.shareToken = h.slice('rate/'.length);
+    return 'rate';
+  }
   return h;
 }
 window.addEventListener('hashchange', () => {
@@ -125,7 +175,7 @@ document.querySelector('.topbar').addEventListener('click', e => {
 
 function render() {
   document.querySelectorAll('.navbtn').forEach(b => b.classList.toggle('active', b.dataset.nav === S.route));
-  const views = { home: viewHome, add: viewAdd, closet: viewCloset, stylist: viewStylist, pack: viewPack, lookbook: viewLookbook, 'stylist-for': viewStylistFor };
+  const views = { home: viewHome, add: viewAdd, closet: viewCloset, stylist: viewStylist, pack: viewPack, lookbook: viewLookbook, 'stylist-for': viewStylistFor, rate: viewRate };
   (views[S.route] || viewHome)();
   window.scrollTo(0, 0);
 }
@@ -255,6 +305,7 @@ function renderSyncCard() {
       await pushNow(); // make sure the cloud copy is current before sharing
       const r = await createShareLink(S.syncCode);
       if (r.error) { toast(r.error); return; }
+      await setSetting('shareToken', r.url.split('/stylist-for/')[1]);
       document.getElementById('share-out').textContent = r.url;
       if (navigator.share) {
         try { await navigator.share({ title: 'Style my closet', url: r.url }); } catch { /* user closed the sheet */ }
@@ -346,7 +397,7 @@ async function renderMorningCard() {
     const days = await forecast(S.homeCity.lat, S.homeCity.lon, 2);
     const d = days[1] || days[0];
     const w = describeWmo(d.code);
-    const outfits = generateOutfits(S.items, { target: 2.5, temp: d.tMax, wears: S.wears, count: 1 });
+    const outfits = generateOutfits(S.items, { target: 2.5, temp: d.tMax, wears: S.wears, count: 1, prefs: S.prefs });
     if (!outfits.length) {
       box.innerHTML = `<div class="card" style="max-width:640px"><h3>Tomorrow</h3><p class="muted" style="margin-top:6px">${w.icon} ${w.text}, ${d.tMin}–${d.tMax}° in ${esc(S.homeCity.name)}. Add a top, bottom and shoes to get a morning outfit here.</p></div>`;
       return;
@@ -1084,6 +1135,7 @@ function viewStylist() {
       renderBuilder(document.getElementById('st-builder'), S.items.filter(i => !i.laundry), {
         submitLabel: 'Wear it → Mirror check',
         nameField: false,
+        prefs: S.prefs,
         onSubmit: ({ items, note }) => openMirrorModal(items.map(i => i.id), note || 'Styled by hand'),
       });
     }
@@ -1134,7 +1186,7 @@ function runStylist() {
   const st = S.stylist;
   st.title = st.text.trim() || st.chip || 'Styled for you';
   st.shown = new Set();
-  st.results = generateOutfits(S.items, { target: stylistTarget(), wears: S.wears, count: 3 });
+  st.results = generateOutfits(S.items, { target: stylistTarget(), wears: S.wears, count: 3, prefs: S.prefs });
   st.results.forEach(o => st.shown.add(o.key));
   renderOutfits();
   if (!st.results.length) toast('Not enough items — you need a top, bottom and shoes (or a dress and shoes).');
@@ -1150,7 +1202,7 @@ function renderOutfits() {
   box.querySelectorAll('[data-swap]').forEach(b => b.addEventListener('click', () => {
     const [idx, itemId] = b.dataset.swap.split(':');
     const o = st.results[+idx];
-    const alts = swapAlternatives(S.items, o, itemId, stylistTarget(), S.wears);
+    const alts = swapAlternatives(S.items, o, itemId, stylistTarget(), S.wears, S.prefs);
     if (!alts.length) { toast('No alternative for that slot in your closet.'); return; }
     const next = alts.find(a => !st.shown.has(a.items.map(i => i.id).sort().join('|'))) || alts[0];
     const key = next.items.map(i => i.id).sort().join('|');
@@ -1160,7 +1212,7 @@ function renderOutfits() {
   }));
   box.querySelectorAll('[data-shuffle]').forEach(b => b.addEventListener('click', () => {
     const idx = +b.dataset.shuffle;
-    const fresh = generateOutfits(S.items, { target: stylistTarget(), wears: S.wears, count: 1, exclude: st.shown });
+    const fresh = generateOutfits(S.items, { target: stylistTarget(), wears: S.wears, count: 1, exclude: st.shown, prefs: S.prefs });
     if (!fresh.length) { toast('That was everything your closet can make for this occasion.'); return; }
     st.results[idx] = fresh[0];
     st.shown.add(fresh[0].key);
@@ -1203,7 +1255,7 @@ function renderBuilder(container, items, opts) {
     const complete = sel.shoes && (sel.dress || (sel.top && sel.bottom));
     let hint = '';
     if (chosen.length >= 2) {
-      const s = scoreOutfit(chosen, 3, null);
+      const s = scoreOutfit(chosen, 3, null, opts.prefs || null);
       const grade = s.score >= 85 ? 'Excellent' : s.score >= 65 ? 'Strong' : 'Workable';
       hint = `<div class="harmony-hint"><b>${grade} colors.</b> ${esc(s.why[0] || '')}</div>`;
     }
@@ -1282,6 +1334,93 @@ async function viewStylistFor() {
   });
 }
 
+// ============================================================ RATE A LOOK (invited reviewer)
+const RATE_TAGS = ['Too small', 'Too big', 'Not with these'];
+
+async function viewRate() {
+  $view.innerHTML = `<div class="pagehead"><h1>Rate the look</h1><p>Loading…</p></div>`;
+  const r = await fetchLooksByToken(S.shareToken);
+  if (r.error) { $view.innerHTML = `<div class="pagehead"><h1>Rate the look</h1></div><div class="empty-shelf" style="padding:40px">${esc(r.error)}</div>`; return; }
+  const myName = localStorage.getItem('raterName') || '';
+  const unrated = r.looks.filter(l => !(l.ratings || []).some(x => !x.ai && x.by === myName && myName));
+  const queue = unrated.length ? unrated : r.looks;
+  if (!queue.length) { $view.innerHTML = `<div class="pagehead"><h1>Rate the look</h1></div><div class="empty-shelf" style="padding:40px">No looks waiting — you're all caught up.</div>`; return; }
+  rateOne(queue, 0);
+}
+
+function rateOne(queue, idx) {
+  const look = queue[idx];
+  const verdicts = {}; // itemId -> love|ok|no
+  const tags = {};     // itemId -> [..]
+  let outfitRating = 0;
+  $view.innerHTML = `
+    <div class="pagehead"><h1>Rate the look</h1><p>${esc(look.occasion || 'A look')} · ${fmtDate(look.at)}${queue.length > 1 ? ` · ${idx + 1} of ${queue.length}` : ''}</p></div>
+    <div class="card" style="max-width:640px">
+      <div style="text-align:center"><img src="${look.photo}" alt="Outfit photo" style="max-height:52vh;border-radius:14px"></div>
+      <div class="field" style="margin-top:18px"><label class="lab">Each piece — tap your verdict</label>
+        <div class="wear-items" id="r-items">
+          ${look.items.map(i => `
+            <div style="border-top:1px solid var(--line);padding:10px 0">
+              <div class="row" style="display:flex;align-items:center;gap:10px;font-size:14px">
+                <b style="flex:1">${esc(i.name)}</b>
+                ${['love', 'ok', 'no'].map(v => `<button class="chip" data-r-v="${esc(i.id)}:${v}" style="padding:6px 12px">${v === 'love' ? '❤️' : v === 'ok' ? '😐' : '✕'}</button>`).join('')}
+              </div>
+              <div class="chiprow" style="margin-top:8px">
+                ${RATE_TAGS.map(t => `<button class="chip" style="font-size:11.5px;padding:5px 11px" data-r-t="${esc(i.id)}:${esc(t)}">${t}</button>`).join('')}
+              </div>
+            </div>`).join('')}
+        </div>
+      </div>
+      <div class="field"><label class="lab">The whole outfit</label>
+        <div class="hearts-input" id="r-hearts">${[1, 2, 3, 4, 5].map(n => `<button data-h="${n}" aria-label="${n} hearts">♥</button>`).join('')}</div>
+      </div>
+      <div class="field"><label class="lab">Your name</label><input class="input" id="r-name" style="max-width:220px" value="${esc(localStorage.getItem('raterName') || '')}" placeholder="e.g. Rebecca"></div>
+      <div class="field"><label class="lab">Anything to add? (optional)</label><input class="input" id="r-comment" placeholder="e.g. roll the sleeves and it's perfect"></div>
+      <div style="display:flex;gap:10px;flex-wrap:wrap">
+        <button class="btn primary" id="r-send" disabled>Send rating</button>
+        ${queue.length > idx + 1 ? `<button class="btn quiet" id="r-skip">Skip</button>` : ''}
+      </div>
+    </div>`;
+
+  const gate = () => { document.getElementById('r-send').disabled = !(outfitRating && document.getElementById('r-name').value.trim()); };
+  $view.querySelectorAll('[data-r-v]').forEach(b => b.addEventListener('click', () => {
+    const [id, v] = b.dataset.rV.split(':');
+    verdicts[id] = verdicts[id] === v ? undefined : v;
+    if (!verdicts[id]) delete verdicts[id];
+    $view.querySelectorAll(`[data-r-v^="${id}:"]`).forEach(x => x.classList.toggle('on', x.dataset.rV === `${id}:${verdicts[id]}`));
+  }));
+  $view.querySelectorAll('[data-r-t]').forEach(b => b.addEventListener('click', () => {
+    const [id, t] = b.dataset.rT.split(':');
+    tags[id] = tags[id] || [];
+    if (tags[id].includes(t)) tags[id] = tags[id].filter(x => x !== t);
+    else tags[id].push(t);
+    b.classList.toggle('on', tags[id].includes(t));
+  }));
+  document.getElementById('r-hearts').addEventListener('click', e => {
+    const b = e.target.closest('[data-h]');
+    if (!b) return;
+    outfitRating = +b.dataset.h;
+    document.querySelectorAll('#r-hearts button').forEach(x => x.classList.toggle('on', +x.dataset.h <= outfitRating));
+    gate();
+  });
+  document.getElementById('r-name').addEventListener('input', gate);
+  const skip = document.getElementById('r-skip');
+  if (skip) skip.addEventListener('click', () => rateOne(queue, idx + 1));
+  document.getElementById('r-send').addEventListener('click', async () => {
+    const by = document.getElementById('r-name').value.trim();
+    localStorage.setItem('raterName', by);
+    const res = await submitRating(S.shareToken, look.id, {
+      by, outfit: outfitRating, items: verdicts, tags,
+      comment: document.getElementById('r-comment').value.trim(),
+    });
+    if (res.error) { toast(res.error); return; }
+    if (queue.length > idx + 1) { toast('Sent — next look'); rateOne(queue, idx + 1); }
+    else {
+      $view.innerHTML = `<div class="pagehead"><h1>Sent ✓</h1><p>Your ratings help their stylist learn what actually works.</p></div>`;
+    }
+  });
+}
+
 // ============================================================ MIRROR CHECK
 function bindWearButtons() {
   document.querySelectorAll('[data-wear]').forEach(b => {
@@ -1313,6 +1452,9 @@ function openMirrorModal(itemIds, occasion) {
         <div class="field"><label class="lab">How did it feel?</label>
           <div class="hearts-input" id="w-hearts">${[1, 2, 3, 4, 5].map(n => `<button data-h="${n}" aria-label="${n} hearts">♥</button>`).join('')}</div>
         </div>
+        ${S.syncCode ? `<div class="field" id="w-rate-row" style="display:none">
+          <label style="display:flex;gap:8px;align-items:center;font-size:14px"><input type="checkbox" id="w-ask" checked> Ask for ratings — AI reviews it now, and you get a link to text your people</label>
+        </div>` : ''}
         <div style="display:flex;gap:10px;flex-wrap:wrap">
           <button class="btn primary" id="w-save">Log to Lookbook</button>
           <button class="btn quiet" id="w-cancel">Cancel</button>
@@ -1326,8 +1468,10 @@ function openMirrorModal(itemIds, occasion) {
   document.getElementById('w-photo').addEventListener('change', async e => {
     const f = e.target.files[0];
     if (!f) return;
-    photoData = await fileToDataUrl(f);
+    photoData = await downscalePhoto(await fileToDataUrl(f));
     document.getElementById('w-photo-note').textContent = 'Photo attached ✓ — saved to your Lookbook with this outfit.';
+    const rateRow = document.getElementById('w-rate-row');
+    if (rateRow) rateRow.style.display = 'block';
   });
   document.getElementById('w-hearts').addEventListener('click', e => {
     const b = e.target.closest('[data-h]');
@@ -1337,6 +1481,27 @@ function openMirrorModal(itemIds, occasion) {
   });
   document.getElementById('w-save').addEventListener('click', async () => {
     const wear = { id: uid(), date: Date.now(), itemIds: items.map(i => i.id), occasion, rating, photo: photoData };
+    const ask = document.getElementById('w-ask');
+    if (photoData && ask && ask.checked && S.syncCode) {
+      toast('Posting for ratings — the AI is looking…');
+      const look = {
+        photo: photoData, occasion,
+        items: items.map(i => ({ id: i.id, name: i.name, category: i.category, color: i.colors[0].name })),
+      };
+      const res = await postLook(S.syncCode, look);
+      if (res.ok) {
+        wear.lookId = res.lookId;
+        const token = await ensureShareToken();
+        if (res.aiReview) {
+          setTimeout(() => toast(`AI: ${'♥'.repeat(res.aiReview.outfit)} — “${res.aiReview.comment}”`), 3000);
+        }
+        if (token) {
+          const url = `${location.origin}/#/rate/${token}`;
+          if (navigator.share) { try { await navigator.share({ title: 'Rate my outfit', url }); } catch { /* sheet closed */ } }
+          else if (navigator.clipboard) { await navigator.clipboard.writeText(url).catch(() => {}); toast('Rating link copied — text it to your people'); }
+        }
+      } else if (res.error) toast(res.error);
+    }
     await putRecord('wears', wear);
     S.wears.push(wear);
     for (const i of items) {
@@ -1356,7 +1521,7 @@ function openMirrorModal(itemIds, occasion) {
 function viewLookbook() {
   const wears = [...S.wears].sort((a, b) => b.date - a.date);
   $view.innerHTML = `
-    <div class="pagehead"><h1>Lookbook</h1><p>Every look you've worn — searchable style memory.</p></div>
+    <div class="pagehead"><h1>Lookbook</h1><p>Every look you've worn — with what the AI and your people thought.</p></div>
     ${wears.length ? `<div class="look-grid">${wears.map(lookCardHtml).join('')}</div>`
       : `<div class="empty-shelf" style="padding:48px">No looks yet. Generate an outfit in the <a href="#/stylist">Stylist</a> and tap "Wear it".</div>`}`;
   $view.querySelectorAll('[data-del-wear]').forEach(b => b.addEventListener('click', async () => {
@@ -1365,6 +1530,39 @@ function viewLookbook() {
     dirty();
     viewLookbook();
   }));
+  // pull fresh ratings, re-render once if new ones arrived
+  if (S.syncCode) {
+    const before = JSON.stringify(S.looks.map(l => (l.ratings || []).length));
+    refreshPrefs().then(() => {
+      if (S.route === 'lookbook' && JSON.stringify(S.looks.map(l => (l.ratings || []).length)) !== before) viewLookbook();
+    });
+  }
+}
+
+function ratingsHtml(w) {
+  if (!w.lookId) return '';
+  const look = S.looks.find(l => l.id === w.lookId);
+  if (!look || !(look.ratings || []).length) return '';
+  return look.ratings.map(r => {
+    const itemNotes = [];
+    for (const [id, v] of Object.entries(r.items || {})) {
+      if (v === 'no') {
+        const it = look.items.find(x => x.id === id);
+        if (it) itemNotes.push(`✕ ${it.name}${(r.tags && r.tags[id] || []).length ? ` (${r.tags[id].join(', ')})` : ''}`);
+      }
+    }
+    for (const [id, ts] of Object.entries(r.tags || {})) {
+      if ((r.items || {})[id] !== 'no') {
+        const it = look.items.find(x => x.id === id);
+        if (it && ts.length) itemNotes.push(`${it.name}: ${ts.join(', ')}`);
+      }
+    }
+    return `<div style="font-size:11.5px;color:var(--stone);margin-top:5px;line-height:1.45">
+      <b style="color:var(--ink)">${esc(r.by)}</b> <span style="color:var(--slate-deep)">${'♥'.repeat(r.outfit || 0)}</span>
+      ${r.comment ? `<br>“${esc(r.comment)}”` : ''}
+      ${itemNotes.length ? `<br>${esc(itemNotes.join(' · '))}` : ''}
+    </div>`;
+  }).join('');
 }
 
 function lookCardHtml(w) {
@@ -1379,6 +1577,7 @@ function lookCardHtml(w) {
         <div class="date">${fmtDate(w.date)}</div>
         <div class="occ">${esc(w.occasion || 'Worn')}</div>
         <div class="hearts">${'♥'.repeat(w.rating || 0)}<span style="color:#C9C6C0">${'♥'.repeat(5 - (w.rating || 0))}</span></div>
+        ${ratingsHtml(w)}
         <div style="margin-top:6px"><button class="btn quiet" style="padding:4px 0;font-size:12px" data-del-wear="${w.id}">Remove</button></div>
       </div>
     </div>`;
@@ -1520,7 +1719,8 @@ async function boot() {
   S.syncCode = await getSetting('syncCode');
   S.route = parseRoute();
   render();
-  if (S.syncCode) pullOnBoot();
+  if (S.syncCode) { pullOnBoot(); refreshPrefs(); }
+  else S.prefs = computePrefs([], S.wears);
 }
 boot();
 

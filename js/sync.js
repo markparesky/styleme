@@ -57,6 +57,34 @@ export async function dismissSuggestion(code, removeId) {
   await fetch('/api/suggestions', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ id, removeId }) }).catch(() => {});
 }
 
+// ---- posted looks & ratings ----
+export async function postLook(code, look) {
+  const id = await codeToId(code);
+  const res = await fetch('/api/looks', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ id, look }) });
+  const j = await res.json();
+  return res.ok ? { ok: true, lookId: j.lookId, aiReview: j.aiReview } : { error: j.error || 'Could not post the look.' };
+}
+
+export async function fetchLooksOwner(code) {
+  try {
+    const id = await codeToId(code);
+    const res = await fetch('/api/looks?id=' + id);
+    return res.ok ? await res.json() : [];
+  } catch { return []; }
+}
+
+export async function fetchLooksByToken(token) {
+  const res = await fetch('/api/looks?token=' + encodeURIComponent(token));
+  const j = await res.json();
+  return res.ok ? { looks: j } : { error: j.error || 'That link did not work.' };
+}
+
+export async function submitRating(token, lookId, rating) {
+  const res = await fetch('/api/rate', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ token, lookId, rating }) });
+  const j = await res.json();
+  return res.ok ? { ok: true } : { error: j.error || 'Could not send the rating.' };
+}
+
 // Returns { ok: true } | { unconfigured: true } | { error }
 export async function pushCloud(code, data) {
   try {
