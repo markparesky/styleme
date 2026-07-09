@@ -21,7 +21,9 @@ export async function onRequestPost({ request, env }) {
   try {
     const bytes = Uint8Array.from(atob(photo.split(',')[1]), c => c.charCodeAt(0));
     const prompt =
-      `You are cataloging clothes from a mirror photo of a person. List each garment they are WEARING (skip background objects). ` +
+      `You are cataloging clothes from a mirror photo of a person. List EVERY garment they are WEARING, head to toe ` +
+      `(skip background objects). A typical outfit has a top, bottoms, and shoes — always include the footwear if feet are visible, ` +
+      `even partially (sneakers, loafers, boots, sandals). ` +
       `Reply ONLY with JSON, no other text: {"garments": [{"name": "short description e.g. white button-up shirt", ` +
       `"category": "top"|"bottom"|"dress"|"layer"|"shoes"|"accessory", "color": "one main color word"}]}`;
     let res;

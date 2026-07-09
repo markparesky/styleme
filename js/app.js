@@ -17,7 +17,33 @@ const S = {
   syncCode: null,
   looks: [],
   prefs: null,
+  wardrobe: 'all', // 'm' hides dresses; 'f'/'all' show everything
 };
+
+function activeCategories() {
+  return S.wardrobe === 'm' ? CATEGORIES.filter(c => c.id !== 'dress') : CATEGORIES;
+}
+
+function wardrobeChipsHtml() {
+  const opts = [['m', "Men's"], ['f', "Women's"], ['all', 'Everything']];
+  return `<div class="chiprow" id="wardrobe-row" style="margin-top:14px">
+    <span class="muted" style="font-size:12px;align-self:center">Wardrobe:</span>
+    ${opts.map(([v, l]) => `<button class="chip ${S.wardrobe === v ? 'on' : ''}" data-wardrobe="${v}" style="font-size:12px;padding:6px 13px">${l}</button>`).join('')}
+  </div>`;
+}
+
+function bindWardrobeChips() {
+  const row = document.getElementById('wardrobe-row');
+  if (!row) return;
+  row.addEventListener('click', async e => {
+    const b = e.target.closest('[data-wardrobe]');
+    if (!b) return;
+    S.wardrobe = b.dataset.wardrobe;
+    await setSetting('wardrobe', S.wardrobe);
+    row.querySelectorAll('[data-wardrobe]').forEach(x => x.classList.toggle('on', x.dataset.wardrobe === S.wardrobe));
+    toast(S.wardrobe === 'm' ? "Men's wardrobe — dresses hidden" : 'Full wardrobe shown');
+  });
+}
 
 // Learned taste: recompute whenever ratings arrive. Also auto-flag fit notes
 // from "too small/too big" tags so future sizing advice sticks to the item.
@@ -115,6 +141,7 @@ function fmtDate(ts) {
   return new Date(ts).toLocaleDateString(undefined, { weekday: 'short', month: 'short', day: 'numeric' });
 }
 function catLabel(id) { return (CATEGORIES.find(c => c.id === id) || {}).label || id; }
+function catPlural(label) { return label === 'Accessory' ? 'Accessories' : label.endsWith('s') ? label : label + 's'; }
 
 function itemImg(item) {
   return item.img || garmentDataUrl(item.category, item.colors[0].hex, item.name);
@@ -194,9 +221,11 @@ async function viewHome() {
           <button class="btn line" id="snap-look">📷 Snap what I'm wearing</button>
           <button class="btn line" id="seed-demo">Load demo closet (14 items)</button>
         </div>
+        ${wardrobeChipsHtml()}
       </div>
       <div class="morning" id="synccard"></div>`;
     renderSyncCard();
+    bindWardrobeChips();
     document.getElementById('snap-look').addEventListener('click', snapLook);
     document.getElementById('seed-demo').addEventListener('click', async () => {
       const items = demoItems();
@@ -214,6 +243,7 @@ async function viewHome() {
   $view.innerHTML = `
     <div class="pagehead"><h1>StyleMe</h1><p>Your personal stylist.</p></div>
     <p class="statline">You have <b>${n} item${n === 1 ? '' : 's'}</b> in your closet · <b>${S.wears.length}</b> look${S.wears.length === 1 ? '' : 's'} in your Lookbook${wearsThisWeek ? ` · <b>${wearsThisWeek}</b> worn this week` : ''}.</p>
+    ${wardrobeChipsHtml()}
     <div class="hero-cta">
       <button class="btn primary" data-nav-inline="stylist">Style me</button>
       <button class="btn line" id="snap-look">📷 Snap today's look</button>
@@ -222,6 +252,7 @@ async function viewHome() {
     <div class="morning" id="morning"></div>
     <div class="morning" id="synccard"></div>`;
   bindInlineNav();
+  bindWardrobeChips();
   document.getElementById('snap-look').addEventListener('click', snapLook);
   renderMorningCard();
   renderSyncCard();
@@ -284,6 +315,17 @@ async function handleSnap(file) {
 
 function openSnapModal(photo, garments, aiTried) {
   const rows = garments.map(g => ({ g, ...matchGarment(g) }));
+  // The AI often misses shoes; a full look needs top+bottom (or dress) and
+  // shoes, so guarantee a row for each core slot even when undetected.
+  if (rows.length) {
+    const have = new Set(rows.map(r => r.cat));
+    const core = have.has('dress') ? ['shoes'] : ['top', 'bottom', 'shoes'];
+    for (const cat of core) {
+      if (!have.has(cat)) {
+        rows.push({ g: { name: `New ${catLabel(cat).toLowerCase()}`, color: '' }, cat, colorNamed: null, match: null, synthetic: true });
+      }
+    }
+  }
   const catItems = cat => S.items.filter(i => i.category === cat);
   $modal.innerHTML = `
     <div class="modal-back" id="snback">
@@ -293,17 +335,18 @@ function openSnapModal(photo, garments, aiTried) {
         ${rows.length ? `<p class="muted" style="margin-bottom:10px">Here's what I can see — check the matches:</p>` : `<p class="muted" style="margin-bottom:10px">${aiTried ? 'Couldn’t identify the pieces from the photo — ' : ''}Pick what you're wearing:</p>`}
         ${rows.length ? rows.map((r, i) => `
           <div class="field" style="margin-bottom:12px">
-            <label class="lab">${esc(r.g.name)}${r.g.color ? ` · ${esc(r.g.color)}` : ''}</label>
+            <label class="lab">${r.synthetic ? `${esc(catLabel(r.cat))} — not spotted in the photo` : `${esc(r.g.name)}${r.g.color ? ` · ${esc(r.g.color)}` : ''}`}</label>
             <select class="input" data-sn-sel="${i}" style="width:100%">
+              ${r.synthetic ? `<option value="__skip__" selected>— pick or add ${esc(catLabel(r.cat).toLowerCase())} —</option>` : ''}
               ${catItems(r.cat).map(it => `<option value="${it.id}" ${r.match && r.match.id === it.id ? 'selected' : ''}>${esc(it.name)}</option>`).join('')}
-              <option value="__new__" ${!r.match ? 'selected' : ''}>＋ Not in my closet — add "${esc(r.g.name)}"</option>
-              <option value="__skip__">Skip this piece</option>
+              <option value="__new__" ${!r.match && !r.synthetic ? 'selected' : ''}>＋ Not in my closet — add "${esc(r.g.name)}"</option>
+              ${r.synthetic ? '' : '<option value="__skip__">Skip this piece</option>'}
             </select>
           </div>`).join('')
-        : `<div style="max-height:34vh;overflow-y:auto">${CATEGORIES.map(cat => {
+        : `<div style="max-height:34vh;overflow-y:auto">${activeCategories().map(cat => {
             const inCat = catItems(cat.id);
             if (!inCat.length) return '';
-            return `<label class="lab" style="margin-top:10px">${cat.label}s</label>` + inCat.map(it =>
+            return `<label class="lab" style="margin-top:10px">${catPlural(cat.label)}</label>` + inCat.map(it =>
               `<label style="display:flex;gap:8px;align-items:center;font-size:13.5px;padding:3px 0"><input type="checkbox" data-sn-chk="${it.id}"> ${esc(it.name)}</label>`).join('');
           }).join('')}</div>`}
         <div style="display:flex;gap:10px;margin-top:16px;flex-wrap:wrap">
@@ -317,6 +360,7 @@ function openSnapModal(photo, garments, aiTried) {
   document.getElementById('sn-cancel').addEventListener('click', close);
   document.getElementById('sn-go').addEventListener('click', async () => {
     const ids = [];
+    const createdIds = [];
     if (rows.length) {
       for (let i = 0; i < rows.length; i++) {
         const val = document.querySelector(`[data-sn-sel="${i}"]`).value;
@@ -328,21 +372,23 @@ function openSnapModal(photo, garments, aiTried) {
             id: uid(), name: r.g.name, category: r.cat,
             colors: [{ name: c.name, hex: c.hex }], dressiness: 3,
             img: garmentDataUrl(r.cat, c.hex, r.g.name), imgKind: 'silhouette',
+            brandColor: null, size: null, fitNote: null,
             laundry: false, wearCount: 0, lastWorn: null, createdAt: Date.now(),
           };
           await putRecord('items', item);
           S.items.push(item);
           ids.push(item.id);
+          createdIds.push(item.id);
         } else ids.push(val);
       }
-      if (rows.some((r, i) => document.querySelector(`[data-sn-sel="${i}"]`).value === '__new__')) {
-        toast('New pieces added — give them real photos later from My Closet');
-        dirty();
-      }
+      if (createdIds.length) dirty();
     } else {
       document.querySelectorAll('[data-sn-chk]:checked').forEach(cb => ids.push(cb.dataset.snChk));
     }
     if (!ids.length) { toast('Pick at least one piece.'); return; }
+    // After the wear is logged, walk through each new piece's full details
+    // (true color, brand color, size) — a snap doubles as a proper add.
+    S._completeQueue = createdIds;
     close();
     openMirrorModal(ids, '', photo);
   });
@@ -1100,7 +1146,7 @@ function draftRowHtml(d) {
         <div class="row">
           <input class="input" style="max-width:240px" value="${esc(d.name)}" data-d-name="${d.id}" aria-label="Item name">
           <select class="input" data-d-cat="${d.id}" aria-label="Category">
-            ${CATEGORIES.map(c => `<option value="${c.id}" ${c.id === d.category ? 'selected' : ''}>${c.label}</option>`).join('')}
+            ${activeCategories().map(c => `<option value="${c.id}" ${c.id === d.category ? 'selected' : ''}>${c.label}</option>`).join('')}
           </select>
           <button class="btn quiet" data-d-dup="${d.id}" title="I have this in another color too">＋ Another color</button>
           <button class="btn quiet" data-d-del="${d.id}">Remove</button>
@@ -1125,13 +1171,13 @@ function viewCloset() {
   if (q) items = items.filter(i => i.name.toLowerCase().includes(q) || i.colors[0].name.toLowerCase().includes(q));
   if (dressF) items = items.filter(i => i.dressiness === dressF);
 
-  const shelves = CATEGORIES.map(cat => {
+  const shelves = activeCategories().map(cat => {
     const inCat = items.filter(i => i.category === cat.id);
     if (!inCat.length && (q || dressF)) return '';
     const cards = inCat.length
       ? `<div class="shelf-row">${inCat.map(itemCardHtml).join('')}</div>`
       : `<div class="empty-shelf">Nothing here yet — <a href="#/add" data-nav-inline="add">add your first ${cat.label.toLowerCase()}</a></div>`;
-    return `<div class="shelf"><div class="shelf-head"><h3>${cat.label}s</h3><span class="count">${inCat.length}</span></div>${cards}</div>`;
+    return `<div class="shelf"><div class="shelf-head"><h3>${catPlural(cat.label)}</h3><span class="count">${inCat.length}</span></div>${cards}</div>`;
   }).join('');
 
   $view.innerHTML = `
@@ -1162,9 +1208,9 @@ function itemCardHtml(i) {
     </button>`;
 }
 
-function openItemModal(id) {
+function openItemModal(id, onClose = null) {
   const item = S.items.find(i => i.id === id);
-  if (!item) return;
+  if (!item) { if (onClose) onClose(); return; }
   $modal.innerHTML = `
     <div class="modal-back" id="mback">
       <div class="modal" role="dialog" aria-label="Item details">
@@ -1194,7 +1240,7 @@ function openItemModal(id) {
         </div>
       </div>
     </div>`;
-  const close = () => { $modal.innerHTML = ''; };
+  const close = () => { $modal.innerHTML = ''; if (onClose) onClose(); };
   document.getElementById('mback').addEventListener('click', e => { if (e.target.id === 'mback') close(); });
   document.getElementById('mi-close').addEventListener('click', close);
   document.getElementById('mi-dress').addEventListener('input', e => {
@@ -1387,7 +1433,7 @@ function renderBuilder(container, items, opts) {
     container.innerHTML = `
       ${chosen.length ? flatlayHtml(chosen) : '<div class="flatlay" style="display:flex;align-items:center;justify-content:center;color:var(--stone);font-size:14px">Tap pieces below to build the look</div>'}
       ${hint}
-      ${BUILDER_SLOTS.map(slot => {
+      ${BUILDER_SLOTS.filter(s => S.wardrobe !== 'm' || s.cat !== 'dress').map(slot => {
         const inCat = items.filter(i => i.category === slot.cat);
         if (!inCat.length) return '';
         return `
@@ -1595,7 +1641,18 @@ function openMirrorModal(itemIds, occasion, presetPhoto = null) {
         </div>
       </div>
     </div>`;
-  const close = () => { $modal.innerHTML = ''; };
+  const close = () => {
+    $modal.innerHTML = '';
+    // walk through details of pieces created from the snapped photo —
+    // color, brand color, size — one editor per new piece
+    const queue = S._completeQueue || [];
+    S._completeQueue = [];
+    if (queue.length) {
+      toast(`New piece${queue.length > 1 ? 's' : ''} from your photo — set the true color, brand and size`);
+      const next = () => { const id = queue.shift(); if (id) setTimeout(() => openItemModal(id, next), 300); };
+      next();
+    }
+  };
   document.getElementById('wback').addEventListener('click', e => { if (e.target.id === 'wback') close(); });
   document.getElementById('w-cancel').addEventListener('click', close);
   document.getElementById('w-photo-btn').addEventListener('click', () => document.getElementById('w-photo').click());
@@ -1856,6 +1913,7 @@ async function boot() {
   S.items = await getAllRecords('items');
   S.wears = await getAllRecords('wears');
   S.homeCity = await getSetting('homeCity');
+  S.wardrobe = (await getSetting('wardrobe')) || 'all';
   S.syncCode = await getSetting('syncCode');
   S.route = parseRoute();
   render();
