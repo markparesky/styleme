@@ -17,9 +17,10 @@ async function aiReview(env, look) {
     if (!b64) return null;
     const bytes = Uint8Array.from(atob(b64), c => c.charCodeAt(0));
     const itemList = look.items.map(i => `${i.id}: ${i.name} (${i.category}, ${i.color})`).join('; ');
+    const occLine = look.occasion ? `They are dressed for: ${look.occasion}. Judge whether the outfit is APPROPRIATE for that occasion (too casual? too dressy? wrong for the setting?) as well as ` : `Judge `;
     const prompt =
       `You are an honest, kind fashion stylist reviewing a mirror photo of an outfit. ` +
-      `The pieces are: ${itemList}. Judge fit (too tight/loose/long), color harmony, and whether each piece works WITH the others. ` +
+      `The pieces are: ${itemList}. ${occLine}fit (too tight/loose/long), color harmony, and whether each piece works WITH the others. ` +
       `Reply ONLY with JSON, no other text: {"outfit": 1-5, "comment": "max 160 chars, specific and constructive", ` +
       `"items": [{"id": "<id>", "verdict": "love"|"ok"|"no", "comment": "max 80 chars"}]}`;
     let res;

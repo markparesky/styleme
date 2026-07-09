@@ -1354,7 +1354,7 @@ function rateOne(queue, idx) {
   const tags = {};     // itemId -> [..]
   let outfitRating = 0;
   $view.innerHTML = `
-    <div class="pagehead"><h1>Rate the look</h1><p>${esc(look.occasion || 'A look')} · ${fmtDate(look.at)}${queue.length > 1 ? ` · ${idx + 1} of ${queue.length}` : ''}</p></div>
+    <div class="pagehead"><h1>Rate the look</h1><p>${look.occasion ? `<b style="color:var(--ink)">Dressed for: ${esc(look.occasion)}</b> — does it work for that? · ` : ''}${fmtDate(look.at)}${queue.length > 1 ? ` · ${idx + 1} of ${queue.length}` : ''}</p></div>
     <div class="card" style="max-width:640px">
       <div style="text-align:center"><img src="${look.photo}" alt="Outfit photo" style="max-height:52vh;border-radius:14px"></div>
       <div class="field" style="margin-top:18px"><label class="lab">Each piece — tap your verdict</label>
@@ -1429,10 +1429,13 @@ function bindWearButtons() {
   });
 }
 
+const WEAR_OCCASIONS = ['Work', 'Restaurant dinner', 'Dinner party', 'Theme party', 'Wedding', 'Boating', 'Daytime weekend', 'Night out', 'Travel', 'Workout'];
+
 function openMirrorModal(itemIds, occasion) {
   const items = itemIds.map(id => S.items.find(i => i.id === id)).filter(Boolean);
   let rating = 0;
   let photoData = null;
+  let pickedOccasion = occasion || '';
   $modal.innerHTML = `
     <div class="modal-back" id="wback">
       <div class="modal" role="dialog" aria-label="Mirror check">
@@ -1448,6 +1451,12 @@ function openMirrorModal(itemIds, occasion) {
             <div class="row"><img src="${itemImg(i)}" alt=""> <span style="color:var(--good);font-weight:700">✓</span> ${esc(i.name)}
               <label class="wash"><input type="checkbox" data-wash="${i.id}"> into the wash after</label>
             </div>`).join('')}
+        </div>
+        <div class="field"><label class="lab">Dressed for… (optional)</label>
+          <div class="chiprow" id="w-occ">
+            ${[...new Set([...(occasion && !WEAR_OCCASIONS.includes(occasion) ? [occasion] : []), ...WEAR_OCCASIONS])].map(o =>
+              `<button class="chip ${o === occasion ? 'on' : ''}" data-w-occ="${esc(o)}" style="font-size:12px;padding:6px 13px">${esc(o)}</button>`).join('')}
+          </div>
         </div>
         <div class="field"><label class="lab">How did it feel?</label>
           <div class="hearts-input" id="w-hearts">${[1, 2, 3, 4, 5].map(n => `<button data-h="${n}" aria-label="${n} hearts">♥</button>`).join('')}</div>
@@ -1473,6 +1482,12 @@ function openMirrorModal(itemIds, occasion) {
     const rateRow = document.getElementById('w-rate-row');
     if (rateRow) rateRow.style.display = 'block';
   });
+  document.getElementById('w-occ').addEventListener('click', e => {
+    const b = e.target.closest('[data-w-occ]');
+    if (!b) return;
+    pickedOccasion = pickedOccasion === b.dataset.wOcc ? (occasion || '') : b.dataset.wOcc;
+    document.querySelectorAll('[data-w-occ]').forEach(x => x.classList.toggle('on', x.dataset.wOcc === pickedOccasion));
+  });
   document.getElementById('w-hearts').addEventListener('click', e => {
     const b = e.target.closest('[data-h]');
     if (!b) return;
@@ -1480,12 +1495,12 @@ function openMirrorModal(itemIds, occasion) {
     document.querySelectorAll('#w-hearts button').forEach(x => x.classList.toggle('on', +x.dataset.h <= rating));
   });
   document.getElementById('w-save').addEventListener('click', async () => {
-    const wear = { id: uid(), date: Date.now(), itemIds: items.map(i => i.id), occasion, rating, photo: photoData };
+    const wear = { id: uid(), date: Date.now(), itemIds: items.map(i => i.id), occasion: pickedOccasion || occasion, rating, photo: photoData };
     const ask = document.getElementById('w-ask');
     if (photoData && ask && ask.checked && S.syncCode) {
       toast('Posting for ratings — the AI is looking…');
       const look = {
-        photo: photoData, occasion,
+        photo: photoData, occasion: pickedOccasion || occasion,
         items: items.map(i => ({ id: i.id, name: i.name, category: i.category, color: i.colors[0].name })),
       };
       const res = await postLook(S.syncCode, look);
