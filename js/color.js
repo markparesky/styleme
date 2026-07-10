@@ -234,8 +234,19 @@ export async function analyzeImage(srcDataUrl) {
 
   if (cutout || corrected) ctx.putImageData(data, 0, 0);
 
+  // Keep stored images small — the closet syncs as one blob, and PNG
+  // cut-outs are 5-10x the size of WebP. Alpha needs WebP (Chrome/Edge)
+  // or falls back to PNG (Safari can't encode WebP); flat photos take JPEG.
+  let dataUrl;
+  if (cutout) {
+    dataUrl = canvas.toDataURL('image/webp', 0.82);
+    if (!dataUrl.startsWith('data:image/webp')) dataUrl = canvas.toDataURL('image/png');
+  } else {
+    dataUrl = canvas.toDataURL('image/jpeg', 0.82);
+  }
+
   return {
-    dataUrl: canvas.toDataURL('image/png'),
+    dataUrl,
     cutout,
     corrected,
     dominantHex: rgbToHex(domRgb),

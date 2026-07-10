@@ -99,6 +99,10 @@ function dirty() {
 async function pushNow() {
   if (!S.syncCode) return;
   const payload = { items: S.items, wears: S.wears, homeCity: S.homeCity, updatedAt: Date.now() };
+  const size = JSON.stringify(payload).length;
+  if (size > 15 * 1024 * 1024) {
+    toast(`Closet is getting large (${(size / 1048576).toFixed(0)} MB) — sync may start failing soon. Tell Claude to shard it.`);
+  }
   const r = await pushCloud(S.syncCode, payload);
   if (r.ok) await setSetting('lastSyncAt', payload.updatedAt);
   else if (r.unconfigured) toast('Sync isn’t set up on the server yet — see the README (KV binding).');
@@ -242,7 +246,7 @@ async function viewHome() {
   const wearsThisWeek = S.wears.filter(w => w.date > Date.now() - 7 * 864e5).length;
   $view.innerHTML = `
     <div class="pagehead"><h1>StyleMe</h1><p>Your personal stylist.</p></div>
-    <p class="statline">You have <b>${n} item${n === 1 ? '' : 's'}</b> in your closet · <b>${S.wears.length}</b> look${S.wears.length === 1 ? '' : 's'} in your Lookbook${wearsThisWeek ? ` · <b>${wearsThisWeek}</b> worn this week` : ''}.</p>
+    <p class="statline">You have <b>${n} item${n === 1 ? '' : 's'}</b> in your closet · <b>${S.wears.length}</b> look${S.wears.length === 1 ? '' : 's'} in your Lookbook${wearsThisWeek ? ` · <b>${wearsThisWeek}</b> worn this week` : ''}.${S.items.some(i => i.demo) ? ` <button class="btn quiet" id="clear-demo" style="font-size:12.5px;padding:2px 0">Remove the ${S.items.filter(i => i.demo).length} demo items</button>` : ''}</p>
     ${wardrobeChipsHtml()}
     <div class="hero-cta">
       <button class="btn primary" data-nav-inline="stylist">Style me</button>
@@ -254,6 +258,15 @@ async function viewHome() {
   bindInlineNav();
   bindWardrobeChips();
   document.getElementById('snap-look').addEventListener('click', snapLook);
+  const clearDemo = document.getElementById('clear-demo');
+  if (clearDemo) clearDemo.addEventListener('click', async () => {
+    const demos = S.items.filter(i => i.demo);
+    for (const i of demos) await deleteRecord('items', i.id);
+    S.items = S.items.filter(i => !i.demo);
+    toast(`${demos.length} demo items removed`);
+    dirty();
+    render();
+  });
   renderMorningCard();
   renderSyncCard();
 }
@@ -277,14 +290,43 @@ function snapLook() {
   input.click();
 }
 
-const AI_CAT_MAP = { shirt: 'top', top: 'top', tee: 'top', 't-shirt': 'top', blouse: 'top', polo: 'top', sweater: 'layer', hoodie: 'layer', jacket: 'layer', coat: 'layer', blazer: 'layer', cardigan: 'layer', overshirt: 'layer', pants: 'bottom', jeans: 'bottom', trousers: 'bottom', shorts: 'bottom', chinos: 'bottom', skirt: 'bottom', dress: 'dress', shoes: 'shoes', sneakers: 'shoes', loafers: 'shoes', boots: 'shoes', sandals: 'shoes', heels: 'shoes' };
+const AI_CAT_MAP = { shirt: 'top', top: 'top', tee: 'top', 't-shirt': 'top', blouse: 'top', polo: 'top', sweater: 'layer', hoodie: 'layer', jacket: 'layer', coat: 'layer', blazer: 'layer', cardigan: 'layer', overshirt: 'layer', pants: 'bottom', jeans: 'bottom', trousers: 'bottom', shorts: 'bottom', chinos: 'bottom', skirt: 'bottom', dress: 'dress', shoes: 'shoes', sneakers: 'shoes', loafers: 'shoes', boots: 'shoes', sandals: 'shoes', heels: 'shoes', hat: 'accessory', belt: 'accessory', scarf: 'accessory', watch: 'accessory', bag: 'accessory' };
 
-function matchGarment(g) {
+// AI category/name → our category (name keywords beat the model's category
+// field — it files jackets under "top" but says "jacket" in the name)
+function aiCategory(g) {
   const catRaw = (g.category || '').toLowerCase();
   const nameRaw = (g.name || '').toLowerCase();
-  let cat = AI_CAT_MAP[catRaw] || null;
-  if (!cat) for (const k of Object.keys(AI_CAT_MAP)) if (catRaw.includes(k) || nameRaw.includes(k)) { cat = AI_CAT_MAP[k]; break; }
-  if (!cat) cat = 'top';
+  for (const k of Object.keys(AI_CAT_MAP)) if (nameRaw.includes(k)) return AI_CAT_MAP[k];
+  if (AI_CAT_MAP[catRaw]) return AI_CAT_MAP[catRaw];
+  for (const k of Object.keys(AI_CAT_MAP)) if (catRaw.includes(k)) return AI_CAT_MAP[k];
+  return null;
+}
+
+// Ask the AI what a photographed item IS — prefills category, name, and
+// brand when visible ("New Balance shoes · Shoes · Gray"), so the user
+// stops typing names and fixing categories by hand.
+async function enrichDraftWithAI(d) {
+  try {
+    const res = await fetch('/api/identify', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ photo: d.img }) });
+    if (!res.ok) return;
+    const g = ((await res.json()).garments || [])[0];
+    if (!g) return;
+    const draft = S.drafts.find(x => x.id === d.id);
+    if (!draft) return; // removed or already added while the AI was thinking
+    const cat = aiCategory(g);
+    if (cat && (S.wardrobe !== 'm' || cat !== 'dress')) draft.category = cat;
+    if (g.name && !draft.userNamed) draft.name = g.name.charAt(0).toUpperCase() + g.name.slice(1);
+    draft.aiEnriched = true;
+    // don't yank focus from a field the user is typing in
+    const active = document.activeElement;
+    if (!active || !active.closest || !active.closest('#draft-list')) renderDrafts();
+  } catch { /* offline or local — the manual controls still work */ }
+}
+
+function matchGarment(g) {
+  const cat = aiCategory(g) || 'top';
+  const nameRaw = (g.name || '').toLowerCase();
   const colorNamed = NAMED_COLORS.find(c => (g.color || '').toLowerCase().includes(c.name.toLowerCase()));
   let best = null;
   for (const item of S.items) {
@@ -802,6 +844,7 @@ async function handleFiles(files) {
       const dataUrl = await fileToDataUrl(f);
       const a = await analyzeImage(dataUrl);
       addDraft(a);
+      enrichDraftWithAI(S.drafts[S.drafts.length - 1]); // async — fills category/name/brand
     } catch (err) { toast(err.message); }
   }
   renderDrafts();
@@ -909,9 +952,10 @@ async function handleUrl() {
       addDraft(a);
       const d = S.drafts[S.drafts.length - 1];
       if (scraped) {
-        if (scraped.title) d.name = scraped.title;
+        if (scraped.title) { d.name = scraped.title; d.userNamed = true; }
         applyDeclaredColor(d, scraped.color);
       }
+      if (!scraped || !scraped.title) enrichDraftWithAI(d);
       renderDrafts();
       toast(scraped && scraped.title ? `Found "${scraped.title}"` : 'Image added — review below.');
       return;
@@ -1068,7 +1112,9 @@ function renderDrafts() {
     renderDrafts();
   }));
   box.querySelectorAll('[data-d-name]').forEach(inp => inp.addEventListener('input', () => {
-    S.drafts.find(x => x.id === inp.dataset.dName).name = inp.value;
+    const d = S.drafts.find(x => x.id === inp.dataset.dName);
+    d.name = inp.value;
+    d.userNamed = true; // the AI must not overwrite a hand-typed name
   }));
   box.querySelectorAll('[data-d-brandcolor]').forEach(inp => inp.addEventListener('input', () => {
     S.drafts.find(x => x.id === inp.dataset.dBrandcolor).brandColor = inp.value;
@@ -1128,6 +1174,7 @@ function draftRowHtml(d) {
   const notes = [];
   if (d.corrected) notes.push('Warm cast removed ✓');
   if (d.cutout) notes.push('Background cut out ✓');
+  if (d.aiEnriched) notes.push('Recognized ✓');
   if (d.barcode) notes.push(`Barcode ${d.barcode} attached ✓`);
   const noteHtml = d.manualColor
     ? `<span class="qnote warn">This site hides its image data, so the color can't be read — pick it below.</span>`
@@ -1223,8 +1270,13 @@ function openItemModal(id, onClose = null) {
           </div>
           <div style="flex:1;min-width:220px">
             <div class="field"><label class="lab">Name</label><input class="input" id="mi-name" value="${esc(item.name)}"></div>
-            <div class="field"><label class="lab">Color</label>
-              <select class="input" id="mi-color">${NAMED_COLORS.map(c => `<option ${c.name === item.colors[0].name ? 'selected' : ''}>${c.name}</option>`).join('')}</select>
+            <div class="field" style="display:flex;gap:10px">
+              <div style="flex:1"><label class="lab">Color</label>
+                <select class="input" id="mi-color" style="width:100%">${NAMED_COLORS.map(c => `<option ${c.name === item.colors[0].name ? 'selected' : ''}>${c.name}</option>`).join('')}</select>
+              </div>
+              <div style="flex:1"><label class="lab">Category</label>
+                <select class="input" id="mi-cat" style="width:100%">${activeCategories().map(c => `<option value="${c.id}" ${c.id === item.category ? 'selected' : ''}>${c.label}</option>`).join('')}</select>
+              </div>
             </div>
             <div class="field" style="display:flex;gap:10px">
               <div style="flex:1"><label class="lab">Brand's color name</label><input class="input" id="mi-brandcolor" value="${esc(item.brandColor || '')}" placeholder="e.g. Heather Fog"></div>
@@ -1292,8 +1344,11 @@ function openItemModal(id, onClose = null) {
     item.brandColor = document.getElementById('mi-brandcolor').value.trim() || null;
     item.size = document.getElementById('mi-size').value.trim() || null;
     item.fitNote = document.getElementById('mi-fitnote').value.trim() || null;
+    const newCat = document.getElementById('mi-cat').value;
+    const catChanged = newCat !== item.category;
+    item.category = newCat;
     if (newImg) { item.img = newImg.dataUrl; item.imgKind = newImg.kind; }
-    if (colorChanged && item.imgKind === 'silhouette') item.img = garmentDataUrl(item.category, c.hex, item.name);
+    if ((colorChanged || catChanged) && item.imgKind === 'silhouette') item.img = garmentDataUrl(item.category, c.hex, item.name);
     await putRecord('items', item);
     close(); toast('Saved'); render(); dirty();
   });
