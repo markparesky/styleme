@@ -180,15 +180,15 @@ export function scoreOutfit(items, target, recentPairs, prefs = null, weather = 
       const offenders = [];
       for (const i of items) {
         if (i.category === 'layer') { sweat += 14; offenders.push(i.name); }
-        else if (HEAVY_RE.test(i.name)) { sweat += 7; offenders.push(i.name); }
-        if (BREEZY_RE.test(i.name)) sweat -= 6;
+        else if (HEAVY_RE.test(i.name + ' ' + (i.type || ''))) { sweat += 7; offenders.push(i.name); }
+        if (BREEZY_RE.test(i.name + ' ' + (i.type || ''))) sweat -= 6;
       }
       score -= Math.max(0, sweat);
       if (sweat >= 14) why.push(`At ${weather.high}° the ${offenders[0].toLowerCase()} will cook you — something lighter wins the day.`);
       else if (sweat <= -6) why.push(`Light fabrics for a ${weather.high}° day.`);
     }
     if (weather.low != null && weather.low <= 45) {
-      for (const i of items) if (BREEZY_RE.test(i.name)) { score -= 10; why.push(`${i.name} at ${weather.low}° is brave, not stylish.`); break; }
+      for (const i of items) if (BREEZY_RE.test(i.name + ' ' + (i.type || ''))) { score -= 10; why.push(`${i.name} at ${weather.low}° is brave, not stylish.`); break; }
     }
   }
 
@@ -369,7 +369,7 @@ function bestCombo(tops, bottoms, shoesArr, target) {
 
 export function activityOutfit(items, act) {
   const avail = items.filter(i => !i.laundry);
-  const strict = cat => avail.filter(i => i.category === cat && act.match[cat].test(i.name));
+  const strict = cat => avail.filter(i => i.category === cat && act.match[cat].test(i.name + ' ' + (i.type || '')));
   const casual = cat => avail.filter(i => i.category === cat && i.dressiness <= 2);
   const tops = strict('top').length ? strict('top') : casual('top');
   // Athletic activities never fall back to street bottoms — jeans don't work out.

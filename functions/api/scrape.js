@@ -45,7 +45,7 @@ export async function onRequestGet({ request }) {
               sizes = [...new Set(p.variants.map(v => v['option' + (si + 1)]).filter(Boolean))];
             }
           }
-          if (image) return json({ image, title: p.title || null, color, colors, sizes });
+          if (image) return json({ image, title: p.title || null, color, colors, sizes, brand: p.vendor || null });
         }
       }
     }

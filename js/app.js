@@ -16,9 +16,77 @@ const S = {
   homeCity: null,
   syncCode: null,
   looks: [],
+  outfits: [], // saved, named outfits — "Date night navy", "Friday golf"
   prefs: null,
   wardrobe: 'all', // 'm' hides dresses; 'f'/'all' show everything
 };
+
+// Save a set of items as a named outfit (yours, AI-built, or picked by
+// someone else — the byline remembers who put it together).
+function openSaveOutfitModal(itemIds, suggestedName, by) {
+  $modal.innerHTML = `
+    <div class="modal-back" id="soback">
+      <div class="modal" style="max-width:440px" role="dialog" aria-label="Save outfit">
+        <h2>Save this outfit</h2>
+        <div class="field" style="margin-top:14px"><label class="lab">Name it</label>
+          <input class="input" id="so-name" placeholder="e.g. Date night navy, Friday golf" value="${esc(suggestedName || '')}">
+        </div>
+        <div style="display:flex;gap:10px">
+          <button class="btn primary" id="so-save">Save</button>
+          <button class="btn quiet" id="so-cancel">Cancel</button>
+        </div>
+      </div>
+    </div>`;
+  const close = () => { $modal.innerHTML = ''; };
+  document.getElementById('soback').addEventListener('click', e => { if (e.target.id === 'soback') close(); });
+  document.getElementById('so-cancel').addEventListener('click', close);
+  const input = document.getElementById('so-name');
+  input.focus();
+  document.getElementById('so-save').addEventListener('click', async () => {
+    const name = input.value.trim();
+    if (!name) { toast('Give it a name.'); return; }
+    const outfit = { id: uid(), name, itemIds, by: by || 'Me', createdAt: Date.now() };
+    await putRecord('outfits', touch(outfit));
+    S.outfits.push(outfit);
+    close();
+    toast(`Saved — "${name}" is in your outfits`);
+    dirty();
+    if (S.route === 'stylist') renderSavedOutfits();
+  });
+}
+
+function renderSavedOutfits() {
+  const box = document.getElementById('st-saved');
+  if (!box) return;
+  if (!S.outfits.length) { box.innerHTML = ''; return; }
+  const cards = [...S.outfits].sort((a, b) => b.createdAt - a.createdAt).map(o => {
+    const items = o.itemIds.map(id => S.items.find(i => i.id === id)).filter(Boolean);
+    if (!items.length) return '';
+    const missing = o.itemIds.length - items.length;
+    return `
+      <div class="look-card">
+        <div class="look-photo"><div class="minilay">${items.slice(0, 4).map((i, n) => `<img src="${itemImg(i)}" style="left:${[6, 50, 18, 56][n]}%;top:${[8, 6, 50, 48][n]}%" alt="">`).join('')}</div></div>
+        <div class="look-body">
+          <div class="occ">${esc(o.name)}</div>
+          <div class="date">by ${esc(o.by)}${missing ? ` · ${missing} piece${missing > 1 ? 's' : ''} no longer in the closet` : ''}</div>
+          <div style="display:flex;gap:10px;margin-top:8px">
+            <button class="btn primary" style="padding:7px 14px;font-size:12.5px" data-wear='${esc(JSON.stringify(items.map(i => i.id)))}' data-occ="${esc(o.name)}">Wear it</button>
+            <button class="btn quiet" style="padding:7px 0;font-size:12px" data-so-del="${o.id}">Delete</button>
+          </div>
+        </div>
+      </div>`;
+  }).join('');
+  box.innerHTML = cards ? `
+    <div class="sec-head" style="margin:26px 0 14px"><h2 style="font-family:var(--serif);font-size:24px">Saved outfits</h2></div>
+    <div class="look-grid">${cards}</div>` : '';
+  bindWearButtons();
+  box.querySelectorAll('[data-so-del]').forEach(b => b.addEventListener('click', async () => {
+    await deleteRecord('outfits', b.dataset.soDel);
+    S.outfits = S.outfits.filter(o => o.id !== b.dataset.soDel);
+    dirty();
+    renderSavedOutfits();
+  }));
+}
 
 function activeCategories() {
   return S.wardrobe === 'm' ? CATEGORIES.filter(c => c.id !== 'dress') : CATEGORIES;
@@ -110,7 +178,8 @@ async function syncNow() {
   if (!S.auth || syncBusy) return;
   syncBusy = true;
   try {
-    const state = (await getSetting('syncState')) || { items: {}, wears: {} };
+    const state = (await getSetting('syncState')) || { items: {}, wears: {}, outfits: {} };
+    state.outfits = state.outfits || {};
     const r = await fetchManifest(S.auth);
     if (r.unconfigured) { toast('Sync isn’t set up on the server yet (KV binding).'); return; }
     if (r.unauthorized) { toast('Sign-in expired — sign in again from Home.'); return; }
@@ -130,6 +199,7 @@ async function syncNow() {
       }
       m = { items: {}, wears: {} };
     }
+    m.outfits = m.outfits || {};
 
     // ---- pull: records the cloud has newer than ours ----
     let pulled = 0;
@@ -157,6 +227,18 @@ async function syncNow() {
         }
       }
     }
+    for (const [rid, rev] of Object.entries(m.outfits)) {
+      const local = S.outfits.find(o => o.id === rid);
+      if (!local || (local._rev || 0) < rev) {
+        const rec = await fetchRecord(S.auth, 'outfit', rid);
+        if (rec) {
+          if (local) Object.assign(local, rec); else S.outfits.push(rec);
+          await putRecord('outfits', rec);
+          state.outfits[rid] = rec._rev || rev;
+          pulled++;
+        }
+      }
+    }
     // deletions made on other devices: synced before, now absent from manifest
     for (const local of [...S.items]) {
       if (!(local.id in m.items) && state.items[local.id]) {
@@ -174,13 +256,23 @@ async function syncNow() {
         pulled++;
       }
     }
+    for (const local of [...S.outfits]) {
+      if (!(local.id in m.outfits) && state.outfits[local.id]) {
+        await deleteRecord('outfits', local.id);
+        S.outfits = S.outfits.filter(o => o.id !== local.id);
+        delete state.outfits[local.id];
+        pulled++;
+      }
+    }
     if (m.homeCity && !S.homeCity) { S.homeCity = m.homeCity; await setSetting('homeCity', m.homeCity); }
 
     // ---- push: our changes and deletions, in size-bounded chunks ----
     const putItems = S.items.filter(i => (i._rev || 0) > (state.items[i.id] || 0) && (!(i.id in m.items) || m.items[i.id] < (i._rev || 0)));
     const putWears = S.wears.filter(w => (w._rev || 0) > (state.wears[w.id] || 0) && (!(w.id in m.wears) || m.wears[w.id] < (w._rev || 0)));
+    const putOutfits = S.outfits.filter(o => (o._rev || 0) > (state.outfits[o.id] || 0) && (!(o.id in m.outfits) || m.outfits[o.id] < (o._rev || 0)));
     const delItems = Object.keys(state.items).filter(rid => !S.items.some(i => i.id === rid) && (rid in m.items));
     const delWears = Object.keys(state.wears).filter(rid => !S.wears.some(w => w.id === rid) && (rid in m.wears));
+    const delOutfits = Object.keys(state.outfits).filter(rid => !S.outfits.some(o => o.id === rid) && (rid in m.outfits));
 
     const CHUNK = 4 * 1024 * 1024;
     let queueI = [...putItems], queueW = [...putWears];
@@ -191,15 +283,17 @@ async function syncNow() {
       while (queueI.length && size < CHUNK) { const it = queueI.shift(); batchI.push(it); size += JSON.stringify(it).length; }
       while (queueW.length && size < CHUNK) { const w = queueW.shift(); batchW.push(w); size += JSON.stringify(w).length; }
       const body = { putItems: batchI, putWears: batchW };
-      if (first) { body.delItems = delItems; body.delWears = delWears; body.homeCity = S.homeCity; }
+      if (first) { body.delItems = delItems; body.delWears = delWears; body.putOutfits = putOutfits; body.delOutfits = delOutfits; body.homeCity = S.homeCity; }
       first = false;
       if (!batchI.length && !batchW.length && !body.delItems) break;
       const res = await pushRecords(S.auth, body);
       if (res.error) { if (!res.unconfigured) console.warn('sync push:', res.error); break; }
       for (const it of batchI) state.items[it.id] = it._rev || 0;
       for (const w of batchW) state.wears[w.id] = w._rev || 0;
+      for (const o of (body.putOutfits || [])) state.outfits[o.id] = o._rev || 0;
       for (const rid of (body.delItems || [])) delete state.items[rid];
       for (const rid of (body.delWears || [])) delete state.wears[rid];
+      for (const rid of (body.delOutfits || [])) delete state.outfits[rid];
     }
 
     await setSetting('syncState', state);
@@ -228,6 +322,64 @@ function fmtDate(ts) {
 }
 function catLabel(id) { return (CATEGORIES.find(c => c.id === id) || {}).label || id; }
 function catPlural(label) { return label === 'Accessory' ? 'Accessories' : label.endsWith('s') ? label : label + 's'; }
+
+// Garment types per category — structured, so "Lululemon Metal Vent tee"
+// becomes Brand: Lululemon · Type: T-shirt (SS) instead of one long name.
+const GARMENT_TYPES = {
+  top: ['Button-down', 'Dress shirt', 'Polo', 'T-shirt (SS)', 'T-shirt (LS)', 'Henley', 'Tank', 'Blouse'],
+  bottom: ['Jeans', 'Chinos', 'Trousers', 'Shorts', 'Joggers', 'Skirt', 'Swim trunks'],
+  dress: ['Casual dress', 'Cocktail dress', 'Maxi dress', 'Formal gown'],
+  layer: ['Blazer', 'Jacket', 'Overshirt', 'Sweater', 'Hoodie', 'Cardigan', 'Coat', 'Vest'],
+  shoes: ['Sneakers', 'Loafers', 'Derbies', 'Boots', 'Sandals', 'Heels', 'Flats', 'Golf shoes'],
+  accessory: ['Belt', 'Watch', 'Hat', 'Scarf', 'Bag', 'Sunglasses', 'Tie'],
+};
+
+const TYPE_KEYWORDS = [
+  [/button|oxford|poplin|flannel/i, { top: 'Button-down' }],
+  [/polo/i, { top: 'Polo' }],
+  [/long.?sleeve|\bls\b/i, { top: 'T-shirt (LS)' }],
+  [/tee|t-?shirt/i, { top: 'T-shirt (SS)' }],
+  [/henley/i, { top: 'Henley' }], [/tank/i, { top: 'Tank' }],
+  [/jean|denim/i, { bottom: 'Jeans' }], [/chino/i, { bottom: 'Chinos' }],
+  [/trouser|slack/i, { bottom: 'Trousers' }], [/short/i, { bottom: 'Shorts' }],
+  [/jogger|sweatpant/i, { bottom: 'Joggers' }], [/skirt/i, { bottom: 'Skirt' }],
+  [/swim|trunk/i, { bottom: 'Swim trunks' }],
+  [/blazer/i, { layer: 'Blazer' }], [/overshirt/i, { layer: 'Overshirt' }],
+  [/sweater|merino|cashmere|crewneck/i, { layer: 'Sweater' }], [/hoodie/i, { layer: 'Hoodie' }],
+  [/cardigan/i, { layer: 'Cardigan' }], [/coat|parka|puffer/i, { layer: 'Coat' }],
+  [/jacket/i, { layer: 'Jacket' }], [/vest/i, { layer: 'Vest' }],
+  [/sneaker|trainer|runner/i, { shoes: 'Sneakers' }], [/loafer/i, { shoes: 'Loafers' }],
+  [/derby|brogue/i, { shoes: 'Derbies' }], [/boot/i, { shoes: 'Boots' }],
+  [/sandal|flip|slide/i, { shoes: 'Sandals' }], [/heel|pump/i, { shoes: 'Heels' }],
+  [/golf/i, { shoes: 'Golf shoes' }],
+  [/belt/i, { accessory: 'Belt' }], [/watch/i, { accessory: 'Watch' }],
+  [/hat|cap|beanie/i, { accessory: 'Hat' }], [/scarf/i, { accessory: 'Scarf' }],
+];
+
+function typeFromText(text, category) {
+  for (const [re, map] of TYPE_KEYWORDS) {
+    if (re.test(text) && map[category]) return map[category];
+  }
+  return null;
+}
+
+function knownBrands() {
+  return [...new Set(S.items.map(i => (i.brand || '').trim()).filter(Boolean))]
+    .sort((a, b) => a.localeCompare(b));
+}
+
+// every brand ever entered shows up in the alphabetized dropdown
+function brandDatalistHtml() {
+  return `<datalist id="brand-list">${knownBrands().map(b => `<option value="${esc(b)}">`).join('')}</datalist>`;
+}
+
+function typeSelectHtml(attr, category, selected) {
+  const types = GARMENT_TYPES[category] || [];
+  return `<select class="input" ${attr} style="width:auto">
+    <option value="">Type…</option>
+    ${types.map(t => `<option ${t === selected ? 'selected' : ''}>${t}</option>`).join('')}
+  </select>`;
+}
 
 function itemImg(item) {
   return item.img || garmentDataUrl(item.category, item.colors[0].hex, item.name);
@@ -457,6 +609,7 @@ async function enrichDraftWithAI(d) {
     const cat = aiCategory(g);
     if (cat && (S.wardrobe !== 'm' || cat !== 'dress')) draft.category = cat;
     if (g.name && !draft.userNamed) draft.name = g.name.charAt(0).toUpperCase() + g.name.slice(1);
+    if (!draft.type) draft.type = typeFromText(g.name || '', draft.category);
     draft.aiEnriched = true;
     // don't yank focus from a field the user is typing in
     const active = document.activeElement;
@@ -593,7 +746,7 @@ function bindBackupButtons() {
 }
 
 function exportCloset() {
-  const payload = { app: 'styleme', exportedAt: new Date().toISOString(), items: S.items, wears: S.wears, homeCity: S.homeCity };
+  const payload = { app: 'styleme', exportedAt: new Date().toISOString(), items: S.items, wears: S.wears, outfits: S.outfits, homeCity: S.homeCity };
   const blob = new Blob([JSON.stringify(payload)], { type: 'application/json' });
   const a = document.createElement('a');
   a.href = URL.createObjectURL(blob);
@@ -612,7 +765,7 @@ async function importCloset(file) {
   const replace = S.items.length === 0 ||
     window.confirm('Replace this device’s closet with the backup?\n\nOK = replace everything\nCancel = merge (adds what’s missing)');
   if (replace) {
-    await clearStore('items'); await clearStore('wears');
+    await clearStore('items'); await clearStore('wears'); await clearStore('outfits'); S.outfits = [];
     S.items = []; S.wears = [];
   }
   let added = 0;
@@ -620,6 +773,8 @@ async function importCloset(file) {
   for (const it of data.items) if (!haveItems.has(it.id)) { S.items.push(it); await putRecord('items', touch(it)); added++; }
   const haveWears = new Set(S.wears.map(w => w.id));
   for (const w of (data.wears || [])) if (!haveWears.has(w.id)) { S.wears.push(w); await putRecord('wears', touch(w)); }
+  const haveOutfits = new Set(S.outfits.map(o => o.id));
+  for (const o of (data.outfits || [])) if (!haveOutfits.has(o.id)) { S.outfits.push(o); await putRecord('outfits', touch(o)); }
   if (data.homeCity && !S.homeCity) { S.homeCity = data.homeCity; await setSetting('homeCity', data.homeCity); }
   toast(`Imported ${added} item${added === 1 ? '' : 's'}`);
   dirty();
@@ -1157,7 +1312,8 @@ async function handleUrl() {
       addDraft(a);
       const d = S.drafts[S.drafts.length - 1];
       if (scraped) {
-        if (scraped.title) { d.name = scraped.title; d.userNamed = true; }
+        if (scraped.title) { d.name = scraped.title; d.userNamed = true; d.type = typeFromText(scraped.title, d.category); }
+        if (scraped.brand) d.brand = scraped.brand;
         applyDeclaredColor(d, scraped.color);
       }
       if (!scraped || !scraped.title) enrichDraftWithAI(d);
@@ -1241,7 +1397,8 @@ function openColorwayModal(scraped, analysis) {
     for (const label of picked) {
       addDraft(analysis);
       const d = S.drafts[S.drafts.length - 1];
-      if (scraped.title) d.name = scraped.title;
+      if (scraped.title) { d.name = scraped.title; d.userNamed = true; d.type = typeFromText(scraped.title, d.category); }
+      if (scraped.brand) d.brand = scraped.brand;
       if (label !== 'As shown') applyDeclaredColor(d, label);
       d.size = size;
     }
@@ -1267,6 +1424,8 @@ function addDraft(a) {
     barcode: null,
     brandColor: null,
     size: null,
+    brand: null,
+    type: null,
     secondary: a.secondaryNamed ? { name: a.secondaryNamed[0].name, hex: a.secondaryNamed[0].hex } : null,
   };
   if (S.pendingBarcode) {
@@ -1285,6 +1444,7 @@ function renderDrafts() {
     <div class="card">
       <h2 style="margin-bottom:6px">Review · ${S.drafts.length} item${S.drafts.length > 1 ? 's' : ''}</h2>
       <p class="muted" style="margin-bottom:10px">Confirm the color by name — navy-vs-black is where outfits go wrong.</p>
+      ${brandDatalistHtml()}
       <div id="rows">${S.drafts.map(draftRowHtml).join('')}</div>
       <div style="display:flex;gap:10px;margin-top:20px">
         <button class="btn primary" id="add-all">Add ${S.drafts.length} to closet</button>
@@ -1329,6 +1489,12 @@ function renderDrafts() {
   box.querySelectorAll('[data-d-brandcolor]').forEach(inp => inp.addEventListener('input', () => {
     S.drafts.find(x => x.id === inp.dataset.dBrandcolor).brandColor = inp.value;
   }));
+  box.querySelectorAll('[data-d-brand]').forEach(inp => inp.addEventListener('input', () => {
+    S.drafts.find(x => x.id === inp.dataset.dBrand).brand = inp.value;
+  }));
+  box.querySelectorAll('[data-d-type]').forEach(sel => sel.addEventListener('change', () => {
+    S.drafts.find(x => x.id === sel.dataset.dType).type = sel.value || null;
+  }));
   box.querySelectorAll('[data-d-size]').forEach(inp => inp.addEventListener('input', () => {
     S.drafts.find(x => x.id === inp.dataset.dSize).size = inp.value;
   }));
@@ -1365,6 +1531,8 @@ function renderDrafts() {
         img: d.img, imgKind: d.imgKind, barcode: d.barcode || null,
         brandColor: (d.brandColor || '').trim() || null,
         size: (d.size || '').trim() || null,
+        brand: (d.brand || '').trim() || null,
+        type: d.type || typeFromText(d.name, d.category),
         fitNote: null,
         laundry: false, wearCount: 0, lastWorn: null, createdAt: Date.now(),
       };
@@ -1410,6 +1578,10 @@ function draftRowHtml(d) {
           <button class="btn quiet" data-d-del="${d.id}">Remove</button>
         </div>
         <div class="row">
+          <input class="input" style="max-width:170px" value="${esc(d.brand || '')}" data-d-brand="${d.id}" list="brand-list" placeholder="Brand (e.g. Lululemon)" aria-label="Brand">
+          ${typeSelectHtml(`data-d-type="${d.id}"`, d.category, d.type)}
+        </div>
+        <div class="row">
           <input class="input" style="max-width:220px" value="${esc(d.brandColor || '')}" data-d-brandcolor="${d.id}" placeholder="Brand's color name (e.g. Heather Fog)" aria-label="Brand color name">
           <input class="input" style="max-width:120px" value="${esc(d.size || '')}" data-d-size="${d.id}" placeholder="Size" aria-label="Size">
         </div>
@@ -1426,16 +1598,24 @@ function viewCloset() {
   const q = (S._closetQ || '').toLowerCase();
   const dressF = S._closetDress || 0;
   let items = S.items;
-  if (q) items = items.filter(i => i.name.toLowerCase().includes(q) || i.colors[0].name.toLowerCase().includes(q));
+  if (q) items = items.filter(i => `${i.name} ${i.brand || ''} ${i.type || ''} ${i.colors[0].name}`.toLowerCase().includes(q));
   if (dressF) items = items.filter(i => i.dressiness === dressF);
 
+  const typeF = S._closetType || null;
   const shelves = activeCategories().map(cat => {
-    const inCat = items.filter(i => i.category === cat.id);
+    let inCat = items.filter(i => i.category === cat.id);
+    // type counts: "T-shirt (SS) × 7" — tap to filter the shelf
+    const typeCounts = {};
+    for (const i of inCat) if (i.type) typeCounts[i.type] = (typeCounts[i.type] || 0) + 1;
+    const typeChips = Object.entries(typeCounts).sort((a, b) => b[1] - a[1])
+      .map(([t, n]) => `<button class="chip ${typeF === t ? 'on' : ''}" data-type-f="${esc(t)}" style="font-size:11px;padding:4px 10px">${esc(t)} × ${n}</button>`).join('');
+    if (typeF && Object.keys(typeCounts).includes(typeF)) inCat = inCat.filter(i => i.type === typeF);
+    else if (typeF && !Object.keys(typeCounts).includes(typeF)) { /* filter belongs to another shelf — show all here */ }
     if (!inCat.length && (q || dressF)) return '';
     const cards = inCat.length
       ? `<div class="shelf-row">${inCat.map(itemCardHtml).join('')}</div>`
       : `<div class="empty-shelf">Nothing here yet — <a href="#/add" data-nav-inline="add">add your first ${cat.label.toLowerCase()}</a></div>`;
-    return `<div class="shelf"><div class="shelf-head"><h3>${catPlural(cat.label)}</h3><span class="count">${inCat.length}</span></div>${cards}</div>`;
+    return `<div class="shelf"><div class="shelf-head" style="flex-wrap:wrap;gap:8px"><h3>${catPlural(cat.label)}</h3><span class="count">${inCat.length}</span>${typeChips ? `<span class="chiprow" style="margin-left:8px">${typeChips}</span>` : ''}</div>${cards}</div>`;
   }).join('');
 
   $view.innerHTML = `
@@ -1449,6 +1629,10 @@ function viewCloset() {
   document.getElementById('closet-q').addEventListener('input', e => { S._closetQ = e.target.value; viewCloset(); });
   const qEl = document.getElementById('closet-q');
   qEl.focus(); qEl.setSelectionRange(qEl.value.length, qEl.value.length);
+  $view.querySelectorAll('[data-type-f]').forEach(b => b.addEventListener('click', () => {
+    S._closetType = S._closetType === b.dataset.typeF ? null : b.dataset.typeF;
+    viewCloset();
+  }));
   $view.querySelectorAll('[data-dress-f]').forEach(b => b.addEventListener('click', () => {
     S._closetDress = S._closetDress === +b.dataset.dressF ? 0 : +b.dataset.dressF;
     viewCloset();
@@ -1461,7 +1645,7 @@ function itemCardHtml(i) {
   return `
     <button class="item-card" data-item="${i.id}">
       <div class="item-img"><img src="${itemImg(i)}" alt="">${i.laundry ? '<span class="laundry-badge">In wash</span>' : ''}</div>
-      <div class="item-name">${esc(i.name)}</div>
+      <div class="item-name">${i.brand ? `<b>${esc(i.brand)}</b> ` : ''}${esc(i.name)}</div>
       <div class="item-sub"><span class="swatch" style="background:${i.colors[0].hex}"></span>${i.colors[1] ? `<span class="swatch" style="background:${i.colors[1].hex};margin-left:-7px"></span>` : ''}${esc(i.colors[0].name)}${i.colors[1] ? ' + ' + esc(i.colors[1].name) : ''}${i.size ? ' · ' + esc(i.size) : ''} · ${DRESS_LABELS[i.dressiness]}</div>
     </button>`;
 }
@@ -1491,6 +1675,10 @@ function openItemModal(id, onClose = null) {
             </div>
             <div class="field"><label class="lab">Second color (stripes, patterns)</label>
               <select class="input" id="mi-color2"><option value="">— none —</option>${NAMED_COLORS.map(c => `<option ${item.colors[1] && c.name === item.colors[1].name ? 'selected' : ''}>${c.name}</option>`).join('')}</select>
+            </div>
+            <div class="field" style="display:flex;gap:10px">
+              <div style="flex:1"><label class="lab">Brand</label>${brandDatalistHtml()}<input class="input" id="mi-brand" value="${esc(item.brand || '')}" list="brand-list" placeholder="e.g. Lululemon"></div>
+              <div style="flex:1"><label class="lab">Type</label>${typeSelectHtml('id="mi-type" style="width:100%"', item.category, item.type)}</div>
             </div>
             <div class="field" style="display:flex;gap:10px">
               <div style="flex:1"><label class="lab">Brand's color name</label><input class="input" id="mi-brandcolor" value="${esc(item.brandColor || '')}" placeholder="e.g. Heather Fog"></div>
@@ -1559,6 +1747,8 @@ function openItemModal(id, onClose = null) {
     item.laundry = document.getElementById('mi-laundry').checked;
     item.brandColor = document.getElementById('mi-brandcolor').value.trim() || null;
     item.size = document.getElementById('mi-size').value.trim() || null;
+    item.brand = document.getElementById('mi-brand').value.trim() || null;
+    item.type = document.getElementById('mi-type').value || null;
     item.fitNote = document.getElementById('mi-fitnote').value.trim() || null;
     const newCat = document.getElementById('mi-cat').value;
     const catChanged = newCat !== item.category;
@@ -1595,6 +1785,7 @@ function viewStylist() {
         <button class="btn line" id="st-build">Build one myself</button>
       </div>
     </div>
+    <div id="st-saved"></div>
     <div id="st-picked" style="margin-top:26px"></div>
     <div id="st-builder-wrap" style="margin-top:26px;display:none"><div class="card" style="max-width:760px"><h3 style="margin-bottom:14px">Build an outfit by hand</h3><div id="st-builder"></div></div></div>
     <div class="outfits" id="st-results"></div>`;
@@ -1616,10 +1807,12 @@ function viewStylist() {
         nameField: false,
         prefs: S.prefs,
         onSubmit: ({ items, note }) => openMirrorModal(items.map(i => i.id), note || 'Styled by hand'),
+        onSave: ({ items }) => openSaveOutfitModal(items.map(i => i.id), '', 'Me'),
       });
     }
   });
   renderOutfits();
+  renderSavedOutfits();
   renderPickedForYou();
 }
 
@@ -1642,12 +1835,14 @@ async function renderPickedForYou() {
             <div class="slotrow">${items.map(i => `<span class="slot">${esc(catLabel(i.category))} · ${esc(i.name)}</span>`).join('')}</div>
             <div class="oc-actions">
               <button class="btn primary" data-wear='${esc(JSON.stringify(items.map(i => i.id)))}' data-occ="Picked by ${esc(s.from)}">Wear it → Mirror check</button>
+              <button class="btn quiet" data-save-outfit='${esc(JSON.stringify(items.map(i => i.id)))}' data-save-name="" data-save-by="${esc(s.from)}">Save outfit</button>
               <button class="btn quiet" data-sugg-dismiss="${esc(s.id)}">Dismiss</button>
             </div>
           </div>`;
       }).join('')}
     </div>`;
   bindWearButtons();
+  bindSaveOutfitButtons();
   box.querySelectorAll('[data-sugg-dismiss]').forEach(b => b.addEventListener('click', async () => {
     await dismissSuggestion(S.auth, b.dataset.suggDismiss);
     renderPickedForYou();
@@ -1698,6 +1893,7 @@ function renderOutfits() {
     renderOutfits();
   }));
   bindWearButtons();
+  bindSaveOutfitButtons();
 }
 
 function outfitCardHtml(o, idx, title) {
@@ -1714,8 +1910,16 @@ function outfitCardHtml(o, idx, title) {
       <div class="oc-actions">
         <button class="btn primary" data-wear='${esc(JSON.stringify(o.items.map(i => i.id)))}' data-occ="${esc(title)}">Wear it → Mirror check</button>
         <button class="btn line" data-shuffle="${idx}">Shuffle</button>
+        <button class="btn quiet" data-save-outfit='${esc(JSON.stringify(o.items.map(i => i.id)))}' data-save-name="${esc(title)}" data-save-by="StyleMe AI">Save outfit</button>
       </div>
     </div>`;
+}
+
+function bindSaveOutfitButtons() {
+  document.querySelectorAll('[data-save-outfit]').forEach(b => {
+    if (b._soBound) return; b._soBound = true;
+    b.addEventListener('click', () => openSaveOutfitModal(JSON.parse(b.dataset.saveOutfit), b.dataset.saveName || '', b.dataset.saveBy || 'Me'));
+  });
 }
 
 // ============================================================ OUTFIT BUILDER (human styling)
@@ -1759,6 +1963,7 @@ function renderBuilder(container, items, opts) {
       <div class="field"><label class="lab">Note (optional)</label><input class="input" id="b-note" placeholder="e.g. for the dinner on Friday — with the sleeves rolled"></div>
       <div style="display:flex;gap:10px;flex-wrap:wrap">
         <button class="btn primary" id="b-submit" ${complete ? '' : 'disabled'}>${esc(opts.submitLabel)}</button>
+        ${opts.onSave ? `<button class="btn line" id="b-save" ${complete ? '' : 'disabled'}>Save outfit</button>` : ''}
         <span class="muted" style="font-size:12.5px;align-self:center">${complete ? '' : 'Needs shoes plus a top and bottom (or a dress).'}</span>
       </div>`;
     container.querySelectorAll('[data-b-pick]').forEach(b => b.addEventListener('click', () => {
@@ -1784,6 +1989,8 @@ function renderBuilder(container, items, opts) {
         from: container.querySelector('#b-from') ? container.querySelector('#b-from').value.trim() : null,
       });
     });
+    const saveBtn = container.querySelector('#b-save');
+    if (saveBtn) saveBtn.addEventListener('click', () => opts.onSave({ items: Object.values(sel) }));
   };
   draw();
 }
@@ -2257,6 +2464,7 @@ function renderPackResult() {
 async function boot() {
   S.items = await getAllRecords('items');
   S.wears = await getAllRecords('wears');
+  S.outfits = await getAllRecords('outfits');
   S.homeCity = await getSetting('homeCity');
   S.wardrobe = (await getSetting('wardrobe')) || 'all';
   S.syncCode = await getSetting('syncCode');

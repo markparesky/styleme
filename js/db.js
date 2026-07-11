@@ -1,6 +1,6 @@
 // IndexedDB wrapper — stores: items, wears, packs, settings
 const DB_NAME = 'styleme';
-const DB_VERSION = 1;
+const DB_VERSION = 2; // v2: saved outfits store
 let dbPromise = null;
 
 function open() {
@@ -13,6 +13,7 @@ function open() {
       if (!db.objectStoreNames.contains('wears')) db.createObjectStore('wears', { keyPath: 'id' });
       if (!db.objectStoreNames.contains('packs')) db.createObjectStore('packs', { keyPath: 'id' });
       if (!db.objectStoreNames.contains('settings')) db.createObjectStore('settings', { keyPath: 'key' });
+      if (!db.objectStoreNames.contains('outfits')) db.createObjectStore('outfits', { keyPath: 'id' });
     };
     req.onsuccess = () => resolve(req.result);
     req.onerror = () => reject(req.error);

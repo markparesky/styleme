@@ -17,12 +17,13 @@ function json(obj, status = 200) {
 }
 
 const mKey = id => 'c2m:' + id;
-const rKey = (id, kind, rid) => (kind === 'item' ? 'c2i:' : 'c2w:') + id + ':' + rid;
+const PREFIX = { item: 'c2i:', wear: 'c2w:', outfit: 'c2o:' };
+const rKey = (id, kind, rid) => PREFIX[kind] + id + ':' + rid;
 
 async function readManifest(env, id) {
   try {
     const m = JSON.parse((await env.STYLEME_KV.get(mKey(id))) || 'null');
-    if (m && m.items && m.wears) return m;
+    if (m && m.items && m.wears) { m.outfits = m.outfits || {}; return m; }
   } catch { /* corrupt — start fresh */ }
   return null;
 }
@@ -36,7 +37,7 @@ export async function onRequestGet({ request, env }) {
   const kind = url.searchParams.get('kind');
   const rid = url.searchParams.get('rid');
   if (kind && rid) {
-    if (!['item', 'wear'].includes(kind)) return json({ error: 'Bad kind.' }, 400);
+    if (!['item', 'wear', 'outfit'].includes(kind)) return json({ error: 'Bad kind.' }, 400);
     const rec = await env.STYLEME_KV.get(rKey(id, kind, rid));
     if (!rec) return json({ error: 'Not found.' }, 404);
     return new Response(rec, { headers: { 'content-type': 'application/json', 'access-control-allow-origin': '*' } });
@@ -54,7 +55,7 @@ export async function onRequestPost({ request, env }) {
   if (!ID_RE.test(id || '')) return json({ error: 'Bad id.' }, 400);
   if (!(await authorized(env, request, id))) return denied();
 
-  const m = (await readManifest(env, id)) || { items: {}, wears: {}, homeCity: null, updatedAt: 0 };
+  const m = (await readManifest(env, id)) || { items: {}, wears: {}, outfits: {}, homeCity: null, updatedAt: 0 };
   const putItems = (body.putItems || []).slice(0, 500);
   const putWears = (body.putWears || []).slice(0, 500);
   for (const it of putItems) {
@@ -74,6 +75,15 @@ export async function onRequestPost({ request, env }) {
   for (const rid of (body.delWears || [])) {
     await env.STYLEME_KV.delete(rKey(id, 'wear', rid));
     delete m.wears[rid];
+  }
+  for (const o of (body.putOutfits || []).slice(0, 200)) {
+    if (!o || !o.id) continue;
+    await env.STYLEME_KV.put(rKey(id, 'outfit', o.id), JSON.stringify(o));
+    m.outfits[o.id] = o._rev || Date.now();
+  }
+  for (const rid of (body.delOutfits || [])) {
+    await env.STYLEME_KV.delete(rKey(id, 'outfit', rid));
+    delete m.outfits[rid];
   }
   if (body.homeCity !== undefined) m.homeCity = body.homeCity;
   m.updatedAt = Date.now();
