@@ -1,5 +1,7 @@
-// Client-side sync: the closet code never leaves the device — only its
-// SHA-256 hash is used as the cloud storage id.
+// Client-side sync + auth.
+// auth = { id, headers } — id is the closet id; headers carry the session
+// key for email sign-in (empty for closet-code mode, where the hashed code
+// itself is the credential and never leaves the device unhashed).
 
 export async function codeToId(code) {
   const data = new TextEncoder().encode('styleme:' + code.trim().toLowerCase());
@@ -7,24 +9,66 @@ export async function codeToId(code) {
   return [...new Uint8Array(buf)].map(b => b.toString(16).padStart(2, '0')).join('');
 }
 
-// Returns { data } | { missing: true } | { unconfigured: true } | { error }
-export async function pullCloud(code) {
+function hdr(auth, extra = {}) {
+  return { ...(auth.headers || {}), ...extra };
+}
+
+// ---- magic-link sign-in ----
+export async function authStart(email) {
+  const res = await fetch('/api/auth', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ action: 'start', email }) });
+  const j = await res.json();
+  return res.ok ? { ok: true } : { error: j.error || 'Could not send the link.', unconfigured: res.status === 501 };
+}
+
+export async function authFinish(token) {
+  const res = await fetch('/api/auth', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ action: 'finish', token }) });
+  const j = await res.json();
+  return res.ok ? j : { error: j.error || 'Sign-in failed.' };
+}
+
+// ---- sharded sync (per-item records + manifest) ----
+export async function fetchManifest(auth) {
   try {
-    const id = await codeToId(code);
-    const res = await fetch('/api/sync?id=' + id);
+    const res = await fetch('/api/sync2?id=' + auth.id, { headers: hdr(auth) });
     if (res.status === 404) return { missing: true };
     if (res.status === 501) return { unconfigured: true };
+    if (res.status === 401) return { unauthorized: true };
     if (!res.ok) return { error: 'Sync read failed (' + res.status + ').' };
-    return { data: await res.json() };
-  } catch (err) {
-    return { error: err.message };
-  }
+    return { manifest: await res.json() };
+  } catch (err) { return { error: err.message }; }
+}
+
+export async function fetchRecord(auth, kind, rid) {
+  try {
+    const res = await fetch(`/api/sync2?id=${auth.id}&kind=${kind}&rid=${encodeURIComponent(rid)}`, { headers: hdr(auth) });
+    return res.ok ? await res.json() : null;
+  } catch { return null; }
+}
+
+export async function pushRecords(auth, body) {
+  try {
+    const res = await fetch('/api/sync2', {
+      method: 'POST',
+      headers: hdr(auth, { 'content-type': 'application/json' }),
+      body: JSON.stringify({ ...body, id: auth.id }),
+    });
+    const j = await res.json();
+    return res.ok ? { ok: true, manifest: j.manifest } : { error: j.error || ('Sync write failed (' + res.status + ').'), unconfigured: res.status === 501 };
+  } catch (err) { return { error: err.message }; }
+}
+
+// legacy whole-blob read — used once to migrate old closets into shards
+export async function pullLegacy(auth) {
+  try {
+    const res = await fetch('/api/sync?id=' + auth.id, { headers: hdr(auth) });
+    if (!res.ok) return null;
+    return await res.json();
+  } catch { return null; }
 }
 
 // ---- stylist sharing ----
-export async function createShareLink(code) {
-  const id = await codeToId(code);
-  const res = await fetch('/api/share', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ id }) });
+export async function createShareLink(auth) {
+  const res = await fetch('/api/share', { method: 'POST', headers: hdr(auth, { 'content-type': 'application/json' }), body: JSON.stringify({ id: auth.id }) });
   const j = await res.json();
   if (!res.ok) return { error: j.error || ('Failed (' + res.status + ')') };
   return { url: location.origin + '/#/stylist-for/' + j.token };
@@ -43,22 +87,20 @@ export async function sendSuggestion(token, outfit) {
   return res.ok ? { ok: true } : { error: j.error || 'Could not send.' };
 }
 
-export async function fetchSuggestions(code) {
+export async function fetchSuggestions(auth) {
   try {
-    const id = await codeToId(code);
-    const res = await fetch('/api/suggestions?id=' + id);
+    const res = await fetch('/api/suggestions?id=' + auth.id, { headers: hdr(auth) });
     if (!res.ok) return [];
     return await res.json();
   } catch { return []; }
 }
 
-export async function dismissSuggestion(code, removeId) {
-  const id = await codeToId(code);
-  await fetch('/api/suggestions', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ id, removeId }) }).catch(() => {});
+export async function dismissSuggestion(auth, removeId) {
+  await fetch('/api/suggestions', { method: 'POST', headers: hdr(auth, { 'content-type': 'application/json' }), body: JSON.stringify({ id: auth.id, removeId }) }).catch(() => {});
 }
 
 // ---- push notifications ----
-export async function subscribePush(code) {
+export async function subscribePush(auth) {
   if (!('serviceWorker' in navigator) || !('PushManager' in window)) {
     return { error: 'unsupported' };
   }
@@ -71,10 +113,9 @@ export async function subscribePush(code) {
   const pad = publicKey.replace(/-/g, '+').replace(/_/g, '/') + '==='.slice((publicKey.length + 3) % 4);
   const appKey = Uint8Array.from(atob(pad), c => c.charCodeAt(0));
   const sub = await reg.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: appKey });
-  const id = await codeToId(code);
   const res = await fetch('/api/push', {
-    method: 'POST', headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ id, subscription: sub.toJSON() }),
+    method: 'POST', headers: hdr(auth, { 'content-type': 'application/json' }),
+    body: JSON.stringify({ id: auth.id, subscription: sub.toJSON() }),
   });
   return res.ok ? { ok: true } : { error: 'Could not register this device.' };
 }
@@ -90,17 +131,15 @@ export async function pushStatus() {
 }
 
 // ---- posted looks & ratings ----
-export async function postLook(code, look) {
-  const id = await codeToId(code);
-  const res = await fetch('/api/looks', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ id, look }) });
+export async function postLook(auth, look) {
+  const res = await fetch('/api/looks', { method: 'POST', headers: hdr(auth, { 'content-type': 'application/json' }), body: JSON.stringify({ id: auth.id, look }) });
   const j = await res.json();
-  return res.ok ? { ok: true, lookId: j.lookId, aiReview: j.aiReview } : { error: j.error || 'Could not post the look.' };
+  return res.ok ? { ok: true, lookId: j.lookId, aiPending: j.aiPending } : { error: j.error || 'Could not post the look.' };
 }
 
-export async function fetchLooksOwner(code) {
+export async function fetchLooksOwner(auth) {
   try {
-    const id = await codeToId(code);
-    const res = await fetch('/api/looks?id=' + id);
+    const res = await fetch('/api/looks?id=' + auth.id, { headers: hdr(auth) });
     return res.ok ? await res.json() : [];
   } catch { return []; }
 }
@@ -115,25 +154,4 @@ export async function submitRating(token, lookId, rating) {
   const res = await fetch('/api/rate', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ token, lookId, rating }) });
   const j = await res.json();
   return res.ok ? { ok: true } : { error: j.error || 'Could not send the rating.' };
-}
-
-// Returns { ok: true } | { unconfigured: true } | { error }
-export async function pushCloud(code, data) {
-  try {
-    const id = await codeToId(code);
-    const res = await fetch('/api/sync', {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ id, data }),
-    });
-    if (res.status === 501) return { unconfigured: true };
-    if (!res.ok) {
-      let msg = 'Sync write failed (' + res.status + ').';
-      try { msg = (await res.json()).error || msg; } catch { /* keep default */ }
-      return { error: msg };
-    }
-    return { ok: true };
-  } catch (err) {
-    return { error: err.message };
-  }
 }

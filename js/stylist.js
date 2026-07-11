@@ -289,6 +289,61 @@ export function swapAlternatives(items, outfit, slotItemId, target, wears, prefs
     .sort((a, b) => b.score - a.score);
 }
 
+// ---- closet gaps & splurge/steal ----
+// Wardrobe staples with tiered buy options: same stylistic object at three
+// prices. The recommendation starts from a real gap, never from inventory.
+export const STAPLES = [
+  { name: 'White leather sneakers', category: 'shoes', color: 'White', dress: 2,
+    tiers: [['Common Projects Achilles', '$440'], ['Oliver Cabell Low 1', '$180'], ['Zara leather sneakers', '$60']] },
+  { name: 'Black derby shoes', category: 'shoes', color: 'Black', dress: 4,
+    tiers: [['Crockett & Jones Audley', '$700'], ['Meermin derby', '$230'], ['Zara leather derbies', '$90']] },
+  { name: 'Tan suede loafers', category: 'shoes', color: 'Tan', dress: 3,
+    tiers: [['J.M. Weston loafer', '$650'], ['Meermin penny loafer', '$240'], ['Mango suede loafers', '$80']] },
+  { name: 'White poplin shirt', category: 'top', color: 'White', dress: 4,
+    tiers: [['Charvet poplin', '$600'], ['Sunspel poplin shirt', '$195'], ['Uniqlo broadcloth shirt', '$30']] },
+  { name: 'Ivory linen shirt', category: 'top', color: 'Ivory', dress: 3,
+    tiers: [['James Perse linen shirt', '$225'], ['J.Crew Baird McNutt linen', '$90'], ['Uniqlo premium linen', '$40']] },
+  { name: 'Navy crewneck sweater', category: 'layer', color: 'Navy', dress: 3,
+    tiers: [['Loro Piana cashmere', '$1200'], ['Naadam cashmere crew', '$150'], ['Uniqlo merino crew', '$50']] },
+  { name: 'Charcoal trousers', category: 'bottom', color: 'Charcoal', dress: 4,
+    tiers: [['Incotex wool trousers', '$450'], ['Suitsupply wool trousers', '$180'], ['Uniqlo smart pants', '$50']] },
+  { name: 'Stone chinos', category: 'bottom', color: 'Stone', dress: 3,
+    tiers: [['James Perse brushed twill', '$265'], ['Bonobos stretch chino', '$100'], ['Uniqlo chino', '$40']] },
+  { name: 'Indigo jeans', category: 'bottom', color: 'Indigo', dress: 2,
+    tiers: [['3sixteen selvedge', '$260'], ['Levi’s 511', '$70'], ['Uniqlo slim jeans', '$50']] },
+  { name: 'Navy blazer', category: 'layer', color: 'Navy', dress: 4,
+    tiers: [['Ring Jacket blazer', '$1100'], ['Suitsupply Havana', '$400'], ['J.Crew Ludlow blazer', '$228']] },
+  { name: 'Camel overshirt', category: 'layer', color: 'Camel', dress: 3,
+    tiers: [['Valstar suede overshirt', '$990'], ['Portuguese Flannel overshirt', '$140'], ['Uniqlo jersey overshirt', '$40']] },
+  { name: 'White tee', category: 'top', color: 'White', dress: 1,
+    tiers: [['James Perse crew tee', '$110'], ['Sunspel Riviera tee', '$95'], ['Uniqlo Supima tee', '$15']] },
+  { name: 'Black poplin shirt', category: 'top', color: 'Black', dress: 3,
+    tiers: [['James Perse matte poplin', '$245'], ['COS poplin shirt', '$89'], ['Uniqlo broadcloth', '$30']] },
+];
+
+// Which staples would multiply this closet? Counts strong new outfits each
+// candidate would unlock. Skips staples the closet already covers.
+export function findGaps(items, prefs = null, max = 3) {
+  const avail = items.filter(i => !i.laundry);
+  const owned = (st) => avail.some(i =>
+    i.category === st.category &&
+    (i.colors[0].name === st.color || i.name.toLowerCase().includes(st.name.toLowerCase().split(' ').pop())) &&
+    Math.abs(i.dressiness - st.dress) <= 1);
+  const results = [];
+  for (const st of STAPLES) {
+    if (owned(st)) continue;
+    const c = metaForColorName(st.color);
+    const virt = { id: '__virt__', name: st.name, category: st.category, dressiness: st.dress, colors: [{ name: c.name, hex: c.hex }], laundry: false };
+    let unlocked = 0;
+    for (const target of [2, 3, 4]) {
+      unlocked += generateOutfits([...avail, virt], { target, count: 8, buildAroundId: '__virt__', prefs })
+        .filter(o => o.score >= 70).length;
+    }
+    if (unlocked >= 3) results.push({ ...st, unlocked });
+  }
+  return results.sort((a, b) => b.unlocked - a.unlocked).slice(0, max);
+}
+
 // ---- activities & theme nights ----
 export const ACTIVITIES = [
   { id: 'golf',    label: 'Golf',         target: 2, missing: 'golf-ready pieces (a polo, chinos or golf shorts, golf shoes or clean sneakers)',

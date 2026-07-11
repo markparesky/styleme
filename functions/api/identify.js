@@ -11,7 +11,10 @@ function withTimeout(promise, ms) {
   return Promise.race([promise, new Promise((_, rej) => setTimeout(() => rej(new Error('AI timeout')), ms))]);
 }
 
+import { sameOrigin, forbidden } from './_guard.js';
+
 export async function onRequestPost({ request, env }) {
+  if (!sameOrigin(request)) return forbidden();
   if (!env.AI) return json({ error: 'The AI is not set up on the server yet (AI binding missing).' }, 501);
   let body;
   try { body = await request.json(); } catch { return json({ error: 'Bad request.' }, 400); }
@@ -25,7 +28,8 @@ export async function onRequestPost({ request, env }) {
       `(skip background objects). A typical outfit has a top, bottoms, and shoes — always include the footwear if feet are visible, ` +
       `even partially (sneakers, loafers, boots, sandals). ` +
       `Reply ONLY with JSON, no other text: {"garments": [{"name": "short description e.g. white button-up shirt", ` +
-      `"category": "top"|"bottom"|"dress"|"layer"|"shoes"|"accessory", "color": "one main color word"}]}`;
+      `"category": "top"|"bottom"|"dress"|"layer"|"shoes"|"accessory", "color": "one main color word", ` +
+      `"box": {"x": left edge 0-1, "y": top edge 0-1, "w": width 0-1, "h": height 0-1} the garment's region in the image}]}`;
     let res;
     try {
       res = await withTimeout(env.AI.run('@cf/meta/llama-3.2-11b-vision-instruct', { prompt, image: [...bytes] }), 30000);
@@ -40,11 +44,19 @@ export async function onRequestPost({ request, env }) {
     const garments = (j.garments || [])
       .filter(g => g && g.name)
       .slice(0, 8)
-      .map(g => ({
-        name: String(g.name).slice(0, 60),
-        category: CATS.includes(g.category) ? g.category : 'top',
-        color: String(g.color || '').slice(0, 30),
-      }));
+      .map(g => {
+        let box = null;
+        const b = g.box;
+        if (b && [b.x, b.y, b.w, b.h].every(v => typeof v === 'number' && v >= 0 && v <= 1) && b.w > 0.04 && b.h > 0.04) {
+          box = { x: b.x, y: b.y, w: Math.min(b.w, 1 - b.x), h: Math.min(b.h, 1 - b.y) };
+        }
+        return {
+          name: String(g.name).slice(0, 60),
+          category: CATS.includes(g.category) ? g.category : 'top',
+          color: String(g.color || '').slice(0, 30),
+          box,
+        };
+      });
     return json({ garments });
   } catch (err) {
     return json({ error: 'Could not read the photo: ' + err.message }, 502);

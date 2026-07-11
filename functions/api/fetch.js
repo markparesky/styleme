@@ -2,7 +2,10 @@
 // Browsers can't read cross-site images (CORS); this fetches them server-side,
 // same as any Workers-based app does. Deploys automatically with the site on
 // Cloudflare Pages — no config needed.
+import { sameOrigin, forbidden } from './_guard.js';
+
 export async function onRequestGet({ request }) {
+  if (!sameOrigin(request)) return forbidden();
   const target = new URL(request.url).searchParams.get('url');
   if (!target || !/^https?:\/\//i.test(target)) {
     return new Response('Provide ?url=https://…', { status: 400 });

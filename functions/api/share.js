@@ -1,6 +1,8 @@
 // Stylist sharing: the closet owner creates a share token; whoever holds the
 // link can VIEW items and submit outfit suggestions — nothing else. The
 // token never reveals the closet id, so a stylist can't write to the closet.
+import { authorized, denied } from './_auth.js';
+
 const ID_RE = /^[a-f0-9]{64}$/;
 
 function json(obj, status = 200) {
@@ -16,6 +18,7 @@ export async function onRequestPost({ request, env }) {
   let body;
   try { body = await request.json(); } catch { return json({ error: 'Bad request.' }, 400); }
   if (!ID_RE.test(body.id || '')) return json({ error: 'Bad id.' }, 400);
+  if (!(await authorized(env, request, body.id))) return denied();
   const old = await env.STYLEME_KV.get('share:' + body.id);
   if (old) await env.STYLEME_KV.delete('sharetok:' + old);
   const abc = 'abcdefghjkmnpqrstuvwxyz23456789';
@@ -34,6 +37,16 @@ export async function onRequestGet({ request, env }) {
   if (!token) return json({ error: 'Missing token.' }, 400);
   const closetId = await env.STYLEME_KV.get('sharetok:' + token);
   if (!closetId) return json({ error: 'That styling link is no longer active.' }, 404);
+  // sharded closet first, whole-blob legacy as fallback
+  try {
+    const m = JSON.parse((await env.STYLEME_KV.get('c2m:' + closetId)) || 'null');
+    if (m && m.items && Object.keys(m.items).length) {
+      const items = (await Promise.all(
+        Object.keys(m.items).map(rid => env.STYLEME_KV.get('c2i:' + closetId + ':' + rid))
+      )).filter(Boolean).map(s => JSON.parse(s));
+      if (items.length) return json({ items });
+    }
+  } catch { /* fall through to legacy */ }
   const raw = await env.STYLEME_KV.get('closet:' + closetId);
   if (!raw) return json({ error: 'This closet has nothing in it yet.' }, 404);
   let data;

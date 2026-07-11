@@ -1,3 +1,4 @@
+import { authorized, denied } from './_auth.js';
 // Cloudflare Pages Function: closet sync.
 // The client hashes the user's closet code (SHA-256) and stores the whole
 // closet JSON under it in KV. Same code on another device = same closet.
@@ -20,6 +21,7 @@ export async function onRequestGet({ request, env }) {
   if (!env.STYLEME_KV) return json({ error: 'Sync is not set up on the server yet (KV binding missing).' }, 501);
   const id = new URL(request.url).searchParams.get('id');
   if (!ID_RE.test(id || '')) return json({ error: 'Bad id.' }, 400);
+  if (!(await authorized(env, request, id))) return denied();
   const val = await env.STYLEME_KV.get('closet:' + id);
   if (!val) return json({ error: 'No closet under that code yet.' }, 404);
   return new Response(val, { headers: { 'content-type': 'application/json', 'access-control-allow-origin': '*' } });
@@ -35,6 +37,7 @@ export async function onRequestPost({ request, env }) {
   if (!ID_RE.test(parsed.id || '') || typeof parsed.data !== 'object' || parsed.data === null) {
     return json({ error: 'Expected { id, data }.' }, 400);
   }
+  if (!(await authorized(env, request, parsed.id))) return denied();
   await env.STYLEME_KV.put('closet:' + parsed.id, JSON.stringify(parsed.data));
   return json({ ok: true });
 }

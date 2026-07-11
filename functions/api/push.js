@@ -2,6 +2,7 @@
 // GET → { publicKey }   POST { id, subscription } → subscribe
 // POST { id, remove: endpoint } → unsubscribe
 import { getVapid } from './_push.js';
+import { authorized, denied } from './_auth.js';
 
 const ID_RE = /^[a-f0-9]{64}$/;
 
@@ -23,6 +24,7 @@ export async function onRequestPost({ request, env }) {
   let body;
   try { body = await request.json(); } catch { return json({ error: 'Bad request.' }, 400); }
   if (!ID_RE.test(body.id || '')) return json({ error: 'Bad id.' }, 400);
+  if (!(await authorized(env, request, body.id))) return denied();
   const key = 'push:' + body.id;
   let subs = [];
   try { subs = JSON.parse((await env.STYLEME_KV.get(key)) || '[]'); } catch { subs = []; }

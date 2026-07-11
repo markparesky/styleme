@@ -1,8 +1,8 @@
 import { putRecord, deleteRecord, getAllRecords, getSetting, setSetting, uid, clearStore } from './db.js';
-import { pullCloud, pushCloud, createShareLink, fetchSharedCloset, sendSuggestion, fetchSuggestions, dismissSuggestion, postLook, fetchLooksOwner, fetchLooksByToken, submitRating, subscribePush, pushStatus } from './sync.js';
+import { codeToId, authStart, authFinish, fetchManifest, fetchRecord, pushRecords, pullLegacy, createShareLink, fetchSharedCloset, sendSuggestion, fetchSuggestions, dismissSuggestion, postLook, fetchLooksOwner, fetchLooksByToken, submitRating, subscribePush, pushStatus } from './sync.js';
 import { analyzeImage, fileToDataUrl, NAMED_COLORS, metaForColorName } from './color.js';
 import { CATEGORIES, garmentDataUrl } from './garments.js';
-import { OCCASIONS, DRESS_CODES, DRESS_LABELS, targetFromText, generateOutfits, swapAlternatives, capsulePlan, ACTIVITIES, scoreOutfit, computePrefs } from './stylist.js';
+import { OCCASIONS, DRESS_CODES, DRESS_LABELS, targetFromText, generateOutfits, swapAlternatives, capsulePlan, ACTIVITIES, scoreOutfit, computePrefs, findGaps } from './stylist.js';
 import { geocode, forecast, describeWmo } from './weather.js';
 import { demoItems } from './demo.js';
 
@@ -48,15 +48,15 @@ function bindWardrobeChips() {
 // Learned taste: recompute whenever ratings arrive. Also auto-flag fit notes
 // from "too small/too big" tags so future sizing advice sticks to the item.
 async function refreshPrefs() {
-  if (S.syncCode) S.looks = await fetchLooksOwner(S.syncCode);
+  if (S.auth) S.looks = await fetchLooksOwner(S.auth);
   S.prefs = computePrefs(S.looks, S.wears);
   for (const look of S.looks) {
     for (const r of (look.ratings || [])) {
       for (const [id, tags] of Object.entries(r.tags || {})) {
         const item = S.items.find(i => i.id === id);
         if (!item || item.fitNote) continue;
-        if (tags.includes('Too small')) { item.fitNote = `${r.by} says it runs small`; await putRecord('items', item); }
-        else if (tags.includes('Too big')) { item.fitNote = `${r.by} says it runs big`; await putRecord('items', item); }
+        if (tags.includes('Too small')) { item.fitNote = `${r.by} says it runs small`; await putRecord('items', touch(item)); }
+        else if (tags.includes('Too big')) { item.fitNote = `${r.by} says it runs big`; await putRecord('items', touch(item)); }
       }
     }
   }
@@ -66,7 +66,7 @@ async function refreshPrefs() {
 async function ensureShareToken() {
   let token = await getSetting('shareToken');
   if (token) return token;
-  const r = await createShareLink(S.syncCode);
+  const r = await createShareLink(S.auth);
   if (r.error) return null;
   token = r.url.split('/stylist-for/')[1];
   await setSetting('shareToken', token);
@@ -89,41 +89,123 @@ function downscalePhoto(dataUrl, maxDim = 900, quality = 0.72) {
   });
 }
 
-// ---------- cloud sync ----------
+// ---------- cloud sync (per-record, mergeable) ----------
+// Every item/wear carries a _rev timestamp. Sync pulls records the cloud has
+// newer, pushes records this device changed, and detects deletions by
+// comparing against the last acknowledged state. Two devices editing
+// different items no longer clobber each other, and there is no whole-closet
+// size ceiling.
 let syncTimer = null;
+let syncBusy = false;
+
+function touch(rec) { rec._rev = Date.now(); return rec; }
+
 function dirty() {
-  if (!S.syncCode) return;
+  if (!S.auth) return;
   clearTimeout(syncTimer);
-  syncTimer = setTimeout(pushNow, 4000);
+  syncTimer = setTimeout(syncNow, 4000);
 }
-async function pushNow() {
-  if (!S.syncCode) return;
-  const payload = { items: S.items, wears: S.wears, homeCity: S.homeCity, updatedAt: Date.now() };
-  const size = JSON.stringify(payload).length;
-  if (size > 15 * 1024 * 1024) {
-    toast(`Closet is getting large (${(size / 1048576).toFixed(0)} MB) — sync may start failing soon. Tell Claude to shard it.`);
-  }
-  const r = await pushCloud(S.syncCode, payload);
-  if (r.ok) await setSetting('lastSyncAt', payload.updatedAt);
-  else if (r.unconfigured) toast('Sync isn’t set up on the server yet — see the README (KV binding).');
-  else if (r.error) toast('Sync failed: ' + r.error);
-}
-async function adoptCloud(data) {
-  await clearStore('items'); await clearStore('wears');
-  S.items = data.items || []; S.wears = data.wears || [];
-  for (const i of S.items) await putRecord('items', i);
-  for (const w of S.wears) await putRecord('wears', w);
-  if (data.homeCity) { S.homeCity = data.homeCity; await setSetting('homeCity', data.homeCity); }
-  await setSetting('lastSyncAt', data.updatedAt || Date.now());
-}
-async function pullOnBoot() {
-  const r = await pullCloud(S.syncCode);
-  if (!r.data) return;
-  const last = (await getSetting('lastSyncAt')) || 0;
-  if ((r.data.updatedAt || 0) > last) {
-    await adoptCloud(r.data);
-    toast('Closet updated from your other device');
-    render();
+
+async function syncNow() {
+  if (!S.auth || syncBusy) return;
+  syncBusy = true;
+  try {
+    const state = (await getSetting('syncState')) || { items: {}, wears: {} };
+    const r = await fetchManifest(S.auth);
+    if (r.unconfigured) { toast('Sync isn’t set up on the server yet (KV binding).'); return; }
+    if (r.unauthorized) { toast('Sign-in expired — sign in again from Home.'); return; }
+    if (r.error) return; // offline etc — try again next dirty()
+
+    let m = r.manifest || null;
+    if (!m) {
+      // first sharded sync for this closet: adopt a legacy blob if one exists
+      const legacy = await pullLegacy(S.auth);
+      if (legacy && Array.isArray(legacy.items) && legacy.items.length && !S.items.length) {
+        S.items = legacy.items.map(i => ({ _rev: 1, ...i }));
+        S.wears = (legacy.wears || []).map(w => ({ _rev: 1, ...w }));
+        for (const i of S.items) await putRecord('items', i);
+        for (const w of S.wears) await putRecord('wears', w);
+        if (legacy.homeCity && !S.homeCity) { S.homeCity = legacy.homeCity; await setSetting('homeCity', legacy.homeCity); }
+        render();
+      }
+      m = { items: {}, wears: {} };
+    }
+
+    // ---- pull: records the cloud has newer than ours ----
+    let pulled = 0;
+    for (const [rid, rev] of Object.entries(m.items)) {
+      const local = S.items.find(i => i.id === rid);
+      if (!local || (local._rev || 0) < rev) {
+        const rec = await fetchRecord(S.auth, 'item', rid);
+        if (rec) {
+          if (local) Object.assign(local, rec); else S.items.push(rec);
+          await putRecord('items', rec);
+          state.items[rid] = rec._rev || rev;
+          pulled++;
+        }
+      }
+    }
+    for (const [rid, rev] of Object.entries(m.wears)) {
+      const local = S.wears.find(w => w.id === rid);
+      if (!local || (local._rev || 0) < rev) {
+        const rec = await fetchRecord(S.auth, 'wear', rid);
+        if (rec) {
+          if (local) Object.assign(local, rec); else S.wears.push(rec);
+          await putRecord('wears', rec);
+          state.wears[rid] = rec._rev || rev;
+          pulled++;
+        }
+      }
+    }
+    // deletions made on other devices: synced before, now absent from manifest
+    for (const local of [...S.items]) {
+      if (!(local.id in m.items) && state.items[local.id]) {
+        await deleteRecord('items', local.id);
+        S.items = S.items.filter(i => i.id !== local.id);
+        delete state.items[local.id];
+        pulled++;
+      }
+    }
+    for (const local of [...S.wears]) {
+      if (!(local.id in m.wears) && state.wears[local.id]) {
+        await deleteRecord('wears', local.id);
+        S.wears = S.wears.filter(w => w.id !== local.id);
+        delete state.wears[local.id];
+        pulled++;
+      }
+    }
+    if (m.homeCity && !S.homeCity) { S.homeCity = m.homeCity; await setSetting('homeCity', m.homeCity); }
+
+    // ---- push: our changes and deletions, in size-bounded chunks ----
+    const putItems = S.items.filter(i => (i._rev || 0) > (state.items[i.id] || 0) && (!(i.id in m.items) || m.items[i.id] < (i._rev || 0)));
+    const putWears = S.wears.filter(w => (w._rev || 0) > (state.wears[w.id] || 0) && (!(w.id in m.wears) || m.wears[w.id] < (w._rev || 0)));
+    const delItems = Object.keys(state.items).filter(rid => !S.items.some(i => i.id === rid) && (rid in m.items));
+    const delWears = Object.keys(state.wears).filter(rid => !S.wears.some(w => w.id === rid) && (rid in m.wears));
+
+    const CHUNK = 4 * 1024 * 1024;
+    let queueI = [...putItems], queueW = [...putWears];
+    let first = true;
+    while (queueI.length || queueW.length || first) {
+      const batchI = [], batchW = [];
+      let size = 0;
+      while (queueI.length && size < CHUNK) { const it = queueI.shift(); batchI.push(it); size += JSON.stringify(it).length; }
+      while (queueW.length && size < CHUNK) { const w = queueW.shift(); batchW.push(w); size += JSON.stringify(w).length; }
+      const body = { putItems: batchI, putWears: batchW };
+      if (first) { body.delItems = delItems; body.delWears = delWears; body.homeCity = S.homeCity; }
+      first = false;
+      if (!batchI.length && !batchW.length && !body.delItems) break;
+      const res = await pushRecords(S.auth, body);
+      if (res.error) { if (!res.unconfigured) console.warn('sync push:', res.error); break; }
+      for (const it of batchI) state.items[it.id] = it._rev || 0;
+      for (const w of batchW) state.wears[w.id] = w._rev || 0;
+      for (const rid of (body.delItems || [])) delete state.items[rid];
+      for (const rid of (body.delWears || [])) delete state.wears[rid];
+    }
+
+    await setSetting('syncState', state);
+    if (pulled) { toast('Closet updated from your other device'); render(); }
+  } finally {
+    syncBusy = false;
   }
 }
 
@@ -193,6 +275,10 @@ function parseRoute() {
     S.shareToken = h.slice('rate/'.length);
     return 'rate';
   }
+  if (h.startsWith('login/')) {
+    S.shareToken = h.slice('login/'.length);
+    return 'login';
+  }
   return h;
 }
 window.addEventListener('hashchange', () => {
@@ -206,7 +292,7 @@ document.querySelector('.topbar').addEventListener('click', e => {
 
 function render() {
   document.querySelectorAll('.navbtn').forEach(b => b.classList.toggle('active', b.dataset.nav === S.route));
-  const views = { home: viewHome, add: viewAdd, closet: viewCloset, stylist: viewStylist, pack: viewPack, lookbook: viewLookbook, 'stylist-for': viewStylistFor, rate: viewRate };
+  const views = { home: viewHome, add: viewAdd, closet: viewCloset, stylist: viewStylist, pack: viewPack, lookbook: viewLookbook, 'stylist-for': viewStylistFor, rate: viewRate, login: viewLogin };
   (views[S.route] || viewHome)();
   window.scrollTo(0, 0);
 }
@@ -233,7 +319,7 @@ async function viewHome() {
     document.getElementById('snap-look').addEventListener('click', snapLook);
     document.getElementById('seed-demo').addEventListener('click', async () => {
       const items = demoItems();
-      for (const it of items) await putRecord('items', it);
+      for (const it of items) await putRecord('items', touch(it));
       S.items.push(...items);
       toast('Demo closet loaded — 14 items');
       dirty();
@@ -254,6 +340,7 @@ async function viewHome() {
       <button class="btn line" data-nav-inline="add">Add items</button>
     </div>
     <div class="morning" id="morning"></div>
+    <div class="morning" id="gaps"></div>
     <div class="morning" id="synccard"></div>`;
   bindInlineNav();
   bindWardrobeChips();
@@ -268,7 +355,39 @@ async function viewHome() {
     render();
   });
   renderMorningCard();
+  renderGapsCard();
   renderSyncCard();
+}
+
+// "One white sneaker unlocks 11 outfits" — computed from the real closet,
+// each gap offered at three price tiers. The app earns nothing either way.
+async function renderGapsCard() {
+  const box = document.getElementById('gaps');
+  if (!box || S.items.filter(i => !i.demo).length < 6) return;
+  // cached for a day per closet signature — the search is combinatorial
+  const sig = S.items.map(i => i.id).sort().join(',').length + ':' + S.items.length;
+  let cache = await getSetting('gapsCache');
+  if (!cache || cache.sig !== sig || Date.now() - cache.at > 86400000) {
+    await new Promise(r => setTimeout(r, 50)); // let the page paint first
+    const gaps = findGaps(S.items, S.prefs);
+    cache = { sig, at: Date.now(), gaps };
+    await setSetting('gapsCache', cache);
+  }
+  if (!cache.gaps.length) { box.innerHTML = ''; return; }
+  const searchUrl = q => `https://www.google.com/search?q=${encodeURIComponent(q)}`;
+  box.innerHTML = `
+    <div class="card" style="max-width:640px">
+      <h3>Worth adding</h3>
+      <p class="muted" style="margin:8px 0 14px">Single pieces that would multiply what you already own — at a splurge, a middle, and a steal.</p>
+      ${cache.gaps.map(g => `
+        <div style="border-top:1px solid var(--line);padding:14px 0">
+          <p style="font-size:14.5px"><b>${esc(g.name)}</b> — would unlock ~${g.unlocked} new outfits</p>
+          <div class="chiprow" style="margin-top:8px">
+            ${g.tiers.map(([brand, price], ti) => `<a class="chip" style="text-decoration:none" href="${searchUrl(brand + ' ' + g.name)}" target="_blank" rel="noopener">${['💎', '⚖️', '🎯'][ti]} ${esc(brand)} · ${esc(price)}</a>`).join('')}
+          </div>
+        </div>`).join('')}
+      <p class="muted" style="font-size:11.5px;margin-top:10px">Prices are ballpark. Links open a search — nothing here is sponsored.</p>
+    </div>`;
 }
 
 // ============================================================ SNAP A LOOK
@@ -288,6 +407,27 @@ function snapLook() {
     });
   }
   input.click();
+}
+
+// crop a fractional region (with a little padding) out of a photo data-URL
+function cropFromPhoto(photoDataUrl, box) {
+  return new Promise(resolve => {
+    const img = new Image();
+    img.onload = () => {
+      const pad = 0.06;
+      const x = Math.max(0, (box.x - pad)) * img.width;
+      const y = Math.max(0, (box.y - pad)) * img.height;
+      const w = Math.min(1 - box.x + pad, box.w + pad * 2) * img.width;
+      const h = Math.min(1 - box.y + pad, box.h + pad * 2) * img.height;
+      if (w < 40 || h < 40) return resolve(null);
+      const c = document.createElement('canvas');
+      c.width = Math.round(w); c.height = Math.round(h);
+      c.getContext('2d').drawImage(img, x, y, w, h, 0, 0, c.width, c.height);
+      resolve(c.toDataURL('image/jpeg', 0.82));
+    };
+    img.onerror = () => resolve(null);
+    img.src = photoDataUrl;
+  });
 }
 
 const AI_CAT_MAP = { shirt: 'top', top: 'top', tee: 'top', 't-shirt': 'top', blouse: 'top', polo: 'top', sweater: 'layer', hoodie: 'layer', jacket: 'layer', coat: 'layer', blazer: 'layer', cardigan: 'layer', overshirt: 'layer', pants: 'bottom', jeans: 'bottom', trousers: 'bottom', shorts: 'bottom', chinos: 'bottom', skirt: 'bottom', dress: 'dress', shoes: 'shoes', sneakers: 'shoes', loafers: 'shoes', boots: 'shoes', sandals: 'shoes', heels: 'shoes', hat: 'accessory', belt: 'accessory', scarf: 'accessory', watch: 'accessory', bag: 'accessory' };
@@ -410,14 +550,21 @@ function openSnapModal(photo, garments, aiTried) {
         if (val === '__new__') {
           const r = rows[i];
           const c = r.colorNamed || metaForColorName('Grey');
+          // crop the garment out of the snapped photo when the AI gave a
+          // usable region — a real photo beats a silhouette
+          let img = null, imgKind = 'silhouette';
+          if (r.g.box) {
+            const cropped = await cropFromPhoto(photo, r.g.box);
+            if (cropped) { img = cropped; imgKind = 'photo'; }
+          }
           const item = {
             id: uid(), name: r.g.name, category: r.cat,
             colors: [{ name: c.name, hex: c.hex }], dressiness: 3,
-            img: garmentDataUrl(r.cat, c.hex, r.g.name), imgKind: 'silhouette',
+            img: img || garmentDataUrl(r.cat, c.hex, r.g.name), imgKind,
             brandColor: null, size: null, fitNote: null,
             laundry: false, wearCount: 0, lastWorn: null, createdAt: Date.now(),
           };
-          await putRecord('items', item);
+          await putRecord('items', touch(item));
           S.items.push(item);
           ids.push(item.id);
           createdIds.push(item.id);
@@ -470,9 +617,9 @@ async function importCloset(file) {
   }
   let added = 0;
   const haveItems = new Set(S.items.map(i => i.id));
-  for (const it of data.items) if (!haveItems.has(it.id)) { S.items.push(it); await putRecord('items', it); added++; }
+  for (const it of data.items) if (!haveItems.has(it.id)) { S.items.push(it); await putRecord('items', touch(it)); added++; }
   const haveWears = new Set(S.wears.map(w => w.id));
-  for (const w of (data.wears || [])) if (!haveWears.has(w.id)) { S.wears.push(w); await putRecord('wears', w); }
+  for (const w of (data.wears || [])) if (!haveWears.has(w.id)) { S.wears.push(w); await putRecord('wears', touch(w)); }
   if (data.homeCity && !S.homeCity) { S.homeCity = data.homeCity; await setSetting('homeCity', data.homeCity); }
   toast(`Imported ${added} item${added === 1 ? '' : 's'}`);
   dirty();
@@ -492,14 +639,16 @@ function renderSyncCard() {
         <input type="file" id="bk-file" accept=".json,application/json" hidden>
       </div>
     </div>`;
-  if (S.syncCode) {
+  if (S.auth) {
     box.innerHTML = `
       <div class="card" style="max-width:640px">
         <h3>Sync is on</h3>
-        <p class="muted" style="margin:8px 0 12px">Enter the same closet code on any device to open this closet there. Changes sync automatically.</p>
+        <p class="muted" style="margin:8px 0 12px">${S.auth.mode === 'email'
+          ? `Signed in as <b>${esc(S.auth.label)}</b> — sign in with the same email on any device and this closet appears.`
+          : 'Enter the same closet code on any device to open this closet there. Changes sync automatically.'}</p>
         <div style="display:flex;gap:10px;flex-wrap:wrap">
           <button class="btn line" id="sync-push">Sync now</button>
-          <button class="btn quiet" id="sync-off">Turn off on this device</button>
+          <button class="btn quiet" id="sync-off">${S.auth.mode === 'email' ? 'Sign out on this device' : 'Turn off on this device'}</button>
         </div>
       </div>
       <div class="card" style="max-width:640px;margin-top:20px">
@@ -518,9 +667,13 @@ function renderSyncCard() {
           <span id="share-out" class="muted" style="font-size:12.5px;word-break:break-all"></span>
         </div>
       </div>` + backupHtml;
-    document.getElementById('sync-push').addEventListener('click', async () => { await pushNow(); toast('Synced'); });
+    document.getElementById('sync-push').addEventListener('click', async () => { await syncNow(); toast('Synced'); });
     document.getElementById('sync-off').addEventListener('click', async () => {
-      S.syncCode = null; await setSetting('syncCode', null); renderSyncCard();
+      S.auth = null; S.syncCode = null;
+      await setSetting('syncCode', null);
+      await setSetting('emailAuth', null);
+      await setSetting('syncState', null);
+      renderSyncCard();
     });
     pushStatus().then(st => {
       const label = document.getElementById('push-status');
@@ -531,15 +684,15 @@ function renderSyncCard() {
       else if (st === 'unsupported') label.textContent = 'Not supported here — on iPhone, add the app to your Home Screen first.';
     });
     document.getElementById('push-on').addEventListener('click', async () => {
-      const r = await subscribePush(S.syncCode);
+      const r = await subscribePush(S.auth);
       if (r.ok) { toast('Notifications on for this device'); renderSyncCard(); }
       else if (r.error === 'denied') toast('Notifications were declined.');
       else if (r.error === 'unsupported') toast('Not supported in this browser — on iPhone, install the app to the Home Screen first.');
       else toast(r.error);
     });
     document.getElementById('share-make').addEventListener('click', async () => {
-      await pushNow(); // make sure the cloud copy is current before sharing
-      const r = await createShareLink(S.syncCode);
+      await syncNow(); // make sure the cloud copy is current before sharing
+      const r = await createShareLink(S.auth);
       if (r.error) { toast(r.error); return; }
       await setSetting('shareToken', r.url.split('/stylist-for/')[1]);
       document.getElementById('share-out').textContent = r.url;
@@ -563,6 +716,12 @@ function renderSyncCard() {
         <button class="btn quiet" id="sync-suggest">Suggest a strong code</button>
       </div>
       <p class="muted" style="font-size:12px;margin-top:10px">Treat it like a password — anyone who knows the code opens this closet. Write it down: it can't be recovered.</p>
+      <div class="divider" style="margin:18px 0">or sign in with email</div>
+      <div style="display:flex;gap:10px;flex-wrap:wrap;align-items:center">
+        <input class="input" id="email-in" type="email" placeholder="you@example.com" style="max-width:260px" autocomplete="email">
+        <button class="btn line" id="email-go">Email me a sign-in link</button>
+      </div>
+      <p class="muted" id="email-note" style="font-size:12px;margin-top:10px">No password to remember — a one-tap link lands in your inbox.</p>
     </div>
     <div class="card" style="max-width:640px;margin-top:20px;opacity:.75">
       <h3>Let someone style you</h3>
@@ -582,23 +741,45 @@ function renderSyncCard() {
   document.getElementById('sync-on').addEventListener('click', async () => {
     const code = document.getElementById('sync-code-in').value.trim();
     if (code.length < 6) { toast('Use at least 6 characters.'); return; }
-    const r = await pullCloud(code);
-    if (r.unconfigured) { toast('Sync isn’t set up on the server yet — see the README (KV binding).'); return; }
-    if (r.error) { toast('Could not reach sync: ' + r.error); return; }
     S.syncCode = code;
     await setSetting('syncCode', code);
-    if (r.data && (r.data.items || []).length && S.items.length &&
-        !window.confirm('A closet already exists under this code.\n\nOK = load it here (replaces this device’s closet)\nCancel = keep this device’s closet and overwrite the cloud copy')) {
-      await pushNow();
-    } else if (r.data && (r.data.items || []).length) {
-      await adoptCloud(r.data);
-      toast('Closet loaded from the cloud');
-    } else {
-      await pushNow();
-      toast('Sync is on — use this code on your other devices');
-    }
+    S.auth = { id: await codeToId(code), headers: {}, mode: 'code' };
+    for (const i of S.items) if (!i._rev) i._rev = 1;
+    for (const w of S.wears) if (!w._rev) w._rev = 1;
+    toast('Sync is on — merging with the cloud…');
+    await syncNow(); // merge, never clobber: pulls what's new, pushes what's ours
+    toast('Sync is on — use this code on your other devices');
     render();
   });
+  document.getElementById('email-go').addEventListener('click', async () => {
+    const email = document.getElementById('email-in').value.trim();
+    if (!email.includes('@')) { toast('Enter your email address.'); return; }
+    const r = await authStart(email);
+    if (r.ok) document.getElementById('email-note').textContent = `Link sent to ${email} — open it on this device. It expires in 15 minutes.`;
+    else if (r.unconfigured) document.getElementById('email-note').textContent = 'Email sign-in isn’t switched on yet — it needs the RESEND_API_KEY secret on the server. The closet code above works today.';
+    else toast(r.error);
+  });
+}
+
+// magic-link landing: /#/login/<token>
+async function viewLogin() {
+  $view.innerHTML = `<div class="pagehead"><h1>Signing you in…</h1></div>`;
+  const r = await authFinish(S.shareToken);
+  if (r.error) {
+    $view.innerHTML = `<div class="pagehead"><h1>Sign-in failed</h1></div><div class="empty-shelf" style="padding:40px">${esc(r.error)}</div>`;
+    return;
+  }
+  const auth = { id: r.id, secret: r.secret, email: r.email };
+  await setSetting('emailAuth', auth);
+  await setSetting('syncCode', null);
+  await setSetting('syncState', null);
+  S.syncCode = null;
+  S.auth = { id: r.id, headers: { 'x-styleme-key': r.secret }, mode: 'email', label: r.email };
+  for (const i of S.items) if (!i._rev) i._rev = 1;
+  for (const w of S.wears) if (!w._rev) w._rev = 1;
+  toast(`Signed in as ${r.email}`);
+  await syncNow();
+  nav('home');
 }
 
 async function renderMorningCard() {
@@ -1086,6 +1267,7 @@ function addDraft(a) {
     barcode: null,
     brandColor: null,
     size: null,
+    secondary: a.secondaryNamed ? { name: a.secondaryNamed[0].name, hex: a.secondaryNamed[0].hex } : null,
   };
   if (S.pendingBarcode) {
     draft.barcode = S.pendingBarcode.code;
@@ -1117,6 +1299,10 @@ function renderDrafts() {
     if (new RegExp(`^(${d.options.map(o => o.name).join('|')}) `).test(d.name)) {
       d.name = `${chosen.name} ${catLabel(d.category).toLowerCase()}`;
     }
+    renderDrafts();
+  }));
+  box.querySelectorAll('[data-d-2x]').forEach(b => b.addEventListener('click', () => {
+    S.drafts.find(x => x.id === b.dataset.d2x).secondary = null;
     renderDrafts();
   }));
   box.querySelectorAll('[data-d-more]').forEach(b => b.addEventListener('click', () => {
@@ -1174,7 +1360,7 @@ function renderDrafts() {
       const item = {
         id: d.id, name: d.name.trim() || `${c.name} ${catLabel(d.category).toLowerCase()}`,
         category: d.category,
-        colors: [{ name: c.name, hex: c.hex }],
+        colors: [{ name: c.name, hex: c.hex }, ...(d.secondary && d.secondary.name !== c.name ? [d.secondary] : [])],
         dressiness: d.dressiness,
         img: d.img, imgKind: d.imgKind, barcode: d.barcode || null,
         brandColor: (d.brandColor || '').trim() || null,
@@ -1182,7 +1368,7 @@ function renderDrafts() {
         fitNote: null,
         laundry: false, wearCount: 0, lastWorn: null, createdAt: Date.now(),
       };
-      await putRecord('items', item);
+      await putRecord('items', touch(item));
       S.items.push(item);
     }
     const added = S.drafts.length;
@@ -1207,7 +1393,8 @@ function draftRowHtml(d) {
   const colorPicker = d.manualColor
     ? `<span class="swatch" style="background:${d.options[d.colorIdx].hex};width:26px;height:26px"></span><select class="input" data-d-colorsel="${d.id}" aria-label="Color">${d.options.map((o, i) => `<option value="${i}" ${i === d.colorIdx ? 'selected' : ''}>${o.name}</option>`).join('')}</select>`
     : d.options.map((o, i) => `<button class="sw-opt ${i === d.colorIdx ? 'sel' : ''}" data-d-id="${d.id}" data-d-color="${i}"><span class="swatch" style="background:${o.hex}"></span>${esc(o.name)}${i === d.colorIdx ? ' ✓' : ''}</button>`).join('') +
-      `<button class="sw-opt" data-d-more="${d.id}" title="Pick from all colors">More colors…</button>`;
+      `<button class="sw-opt" data-d-more="${d.id}" title="Pick from all colors">More colors…</button>` +
+      (d.secondary ? `<span class="sw-opt" style="border-style:dashed"><span class="swatch" style="background:${d.secondary.hex}"></span>also ${esc(d.secondary.name)} <button data-d-2x="${d.id}" style="font-weight:700;padding:0 4px" title="Not a second color">×</button></span>` : '');
   return `
     <div class="review-row">
       <div class="review-thumb"><img src="${d.img}" alt=""></div>
@@ -1275,7 +1462,7 @@ function itemCardHtml(i) {
     <button class="item-card" data-item="${i.id}">
       <div class="item-img"><img src="${itemImg(i)}" alt="">${i.laundry ? '<span class="laundry-badge">In wash</span>' : ''}</div>
       <div class="item-name">${esc(i.name)}</div>
-      <div class="item-sub"><span class="swatch" style="background:${i.colors[0].hex}"></span>${esc(i.colors[0].name)}${i.size ? ' · ' + esc(i.size) : ''} · ${DRESS_LABELS[i.dressiness]}</div>
+      <div class="item-sub"><span class="swatch" style="background:${i.colors[0].hex}"></span>${i.colors[1] ? `<span class="swatch" style="background:${i.colors[1].hex};margin-left:-7px"></span>` : ''}${esc(i.colors[0].name)}${i.colors[1] ? ' + ' + esc(i.colors[1].name) : ''}${i.size ? ' · ' + esc(i.size) : ''} · ${DRESS_LABELS[i.dressiness]}</div>
     </button>`;
 }
 
@@ -1301,6 +1488,9 @@ function openItemModal(id, onClose = null) {
               <div style="flex:1"><label class="lab">Category</label>
                 <select class="input" id="mi-cat" style="width:100%">${activeCategories().map(c => `<option value="${c.id}" ${c.id === item.category ? 'selected' : ''}>${c.label}</option>`).join('')}</select>
               </div>
+            </div>
+            <div class="field"><label class="lab">Second color (stripes, patterns)</label>
+              <select class="input" id="mi-color2"><option value="">— none —</option>${NAMED_COLORS.map(c => `<option ${item.colors[1] && c.name === item.colors[1].name ? 'selected' : ''}>${c.name}</option>`).join('')}</select>
             </div>
             <div class="field" style="display:flex;gap:10px">
               <div style="flex:1"><label class="lab">Brand's color name</label><input class="input" id="mi-brandcolor" value="${esc(item.brandColor || '')}" placeholder="e.g. Heather Fog"></div>
@@ -1362,7 +1552,9 @@ function openItemModal(id, onClose = null) {
     item.name = document.getElementById('mi-name').value.trim() || item.name;
     const c = metaForColorName(document.getElementById('mi-color').value);
     const colorChanged = c.name !== item.colors[0].name;
-    item.colors = [{ name: c.name, hex: c.hex }];
+    const c2name = document.getElementById('mi-color2').value;
+    const c2 = c2name && c2name !== c.name ? metaForColorName(c2name) : null;
+    item.colors = [{ name: c.name, hex: c.hex }, ...(c2 ? [{ name: c2.name, hex: c2.hex }] : [])];
     item.dressiness = +document.getElementById('mi-dress').value;
     item.laundry = document.getElementById('mi-laundry').checked;
     item.brandColor = document.getElementById('mi-brandcolor').value.trim() || null;
@@ -1373,7 +1565,7 @@ function openItemModal(id, onClose = null) {
     item.category = newCat;
     if (newImg) { item.img = newImg.dataUrl; item.imgKind = newImg.kind; }
     if ((colorChanged || catChanged) && item.imgKind === 'silhouette') item.img = garmentDataUrl(item.category, c.hex, item.name);
-    await putRecord('items', item);
+    await putRecord('items', touch(item));
     close(); toast('Saved'); render(); dirty();
   });
   document.getElementById('mi-del').addEventListener('click', async () => {
@@ -1433,8 +1625,8 @@ function viewStylist() {
 
 async function renderPickedForYou() {
   const box = document.getElementById('st-picked');
-  if (!box || !S.syncCode) return;
-  const suggs = await fetchSuggestions(S.syncCode);
+  if (!box || !S.auth) return;
+  const suggs = await fetchSuggestions(S.auth);
   if (!suggs.length) { box.innerHTML = ''; return; }
   box.innerHTML = `
     <div class="sec-head" style="margin-bottom:14px"><h2 style="font-family:var(--serif);font-size:24px">Picked for you</h2></div>
@@ -1457,7 +1649,7 @@ async function renderPickedForYou() {
     </div>`;
   bindWearButtons();
   box.querySelectorAll('[data-sugg-dismiss]').forEach(b => b.addEventListener('click', async () => {
-    await dismissSuggestion(S.syncCode, b.dataset.suggDismiss);
+    await dismissSuggestion(S.auth, b.dataset.suggDismiss);
     renderPickedForYou();
   }));
 }
@@ -1748,7 +1940,7 @@ function openMirrorModal(itemIds, occasion, presetPhoto = null) {
         <div class="field"><label class="lab">How did it feel?</label>
           <div class="hearts-input" id="w-hearts">${[1, 2, 3, 4, 5].map(n => `<button data-h="${n}" aria-label="${n} hearts">♥</button>`).join('')}</div>
         </div>
-        ${S.syncCode ? `<div class="field" id="w-rate-row" style="display:${presetPhoto ? 'block' : 'none'}">
+        ${S.auth ? `<div class="field" id="w-rate-row" style="display:${presetPhoto ? 'block' : 'none'}">
           <label style="display:flex;gap:8px;align-items:center;font-size:14px"><input type="checkbox" id="w-ask" checked> Ask for ratings — AI reviews it now, and you get a link to text your people</label>
         </div>` : ''}
         <div style="display:flex;gap:10px;flex-wrap:wrap">
@@ -1795,13 +1987,13 @@ function openMirrorModal(itemIds, occasion, presetPhoto = null) {
   document.getElementById('w-save').addEventListener('click', async () => {
     const wear = { id: uid(), date: Date.now(), itemIds: items.map(i => i.id), occasion: pickedOccasion || occasion, rating, photo: photoData };
     const ask = document.getElementById('w-ask');
-    if (photoData && ask && ask.checked && S.syncCode) {
+    if (photoData && ask && ask.checked && S.auth) {
       toast('Posting for ratings — the AI is looking…');
       const look = {
         photo: photoData, occasion: pickedOccasion || occasion,
         items: items.map(i => ({ id: i.id, name: i.name, category: i.category, color: i.colors[0].name })),
       };
-      const res = await postLook(S.syncCode, look);
+      const res = await postLook(S.auth, look);
       if (res.ok) {
         wear.lookId = res.lookId;
         const token = await ensureShareToken();
@@ -1815,14 +2007,14 @@ function openMirrorModal(itemIds, occasion, presetPhoto = null) {
         }
       } else if (res.error) toast(res.error);
     }
-    await putRecord('wears', wear);
+    await putRecord('wears', touch(wear));
     S.wears.push(wear);
     for (const i of items) {
       i.wearCount = (i.wearCount || 0) + 1;
       i.lastWorn = Date.now();
       const washEl = document.querySelector(`[data-wash="${i.id}"]`);
       if (washEl && washEl.checked) i.laundry = true;
-      await putRecord('items', i);
+      await putRecord('items', touch(i));
     }
     close();
     toast('Logged to Lookbook — have a great one');
@@ -1844,7 +2036,7 @@ function viewLookbook() {
     viewLookbook();
   }));
   // pull fresh ratings, re-render once if new ones arrived
-  if (S.syncCode) {
+  if (S.auth) {
     const before = JSON.stringify(S.looks.map(l => (l.ratings || []).length));
     refreshPrefs().then(() => {
       if (S.route === 'lookbook' && JSON.stringify(S.looks.map(l => (l.ratings || []).length)) !== before) viewLookbook();
@@ -2068,9 +2260,12 @@ async function boot() {
   S.homeCity = await getSetting('homeCity');
   S.wardrobe = (await getSetting('wardrobe')) || 'all';
   S.syncCode = await getSetting('syncCode');
+  const emailAuth = await getSetting('emailAuth');
+  if (emailAuth) S.auth = { id: emailAuth.id, headers: { 'x-styleme-key': emailAuth.secret }, mode: 'email', label: emailAuth.email };
+  else if (S.syncCode) S.auth = { id: await codeToId(S.syncCode), headers: {}, mode: 'code' };
   S.route = parseRoute();
   render();
-  if (S.syncCode) { pullOnBoot(); refreshPrefs(); }
+  if (S.auth) { syncNow().then(() => refreshPrefs()); }
   else S.prefs = computePrefs([], S.wears);
   // today's weather quietly powers heat-aware suggestions everywhere
   if (S.homeCity && !S._weather) {

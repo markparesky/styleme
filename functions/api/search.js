@@ -50,7 +50,10 @@ async function bingImages(q) {
   return out.length ? out : null;
 }
 
+import { sameOrigin, forbidden } from './_guard.js';
+
 export async function onRequestGet({ request }) {
+  if (!sameOrigin(request)) return forbidden();
   const q = new URL(request.url).searchParams.get('q');
   if (!q || q.trim().length < 3) return json({ error: 'Type at least a few characters.' }, 400);
   let results = null;

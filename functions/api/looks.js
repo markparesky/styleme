@@ -1,6 +1,8 @@
 // Posted looks: a mirror photo + its items, open for rating by invited
 // people and by AI. Owner posts/reads by closet id; reviewers read by
 // share token (same token as the stylist link).
+import { authorized, denied } from './_auth.js';
+
 const ID_RE = /^[a-f0-9]{64}$/;
 
 function json(obj, status = 200) {
@@ -95,6 +97,7 @@ export async function onRequestPost(context) {
     return json({ error: 'Expected { id, look: { photo, items } }.' }, 400);
   }
   if (look.photo.length > 800000) return json({ error: 'Photo too large.' }, 413);
+  if (!(await authorized(env, request, id))) return denied();
   const key = 'look:' + id;
   let list = [];
   try { list = JSON.parse((await env.STYLEME_KV.get(key)) || '[]'); } catch { list = []; }
@@ -120,6 +123,7 @@ export async function onRequestGet({ request, env }) {
   const token = url.searchParams.get('token');
   if (token) closetId = await env.STYLEME_KV.get('sharetok:' + token);
   if (!ID_RE.test(closetId || '')) return json({ error: token ? 'That link is no longer active.' : 'Bad id.' }, token ? 404 : 400);
+  if (!token && !(await authorized(env, request, closetId))) return denied();
   let list = [];
   try { list = JSON.parse((await env.STYLEME_KV.get('look:' + closetId)) || '[]'); } catch { list = []; }
   return json(list);
