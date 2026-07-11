@@ -1,5 +1,5 @@
 import { putRecord, deleteRecord, getAllRecords, getSetting, setSetting, uid, clearStore } from './db.js';
-import { pullCloud, pushCloud, createShareLink, fetchSharedCloset, sendSuggestion, fetchSuggestions, dismissSuggestion, postLook, fetchLooksOwner, fetchLooksByToken, submitRating } from './sync.js';
+import { pullCloud, pushCloud, createShareLink, fetchSharedCloset, sendSuggestion, fetchSuggestions, dismissSuggestion, postLook, fetchLooksOwner, fetchLooksByToken, submitRating, subscribePush, pushStatus } from './sync.js';
 import { analyzeImage, fileToDataUrl, NAMED_COLORS, metaForColorName } from './color.js';
 import { CATEGORIES, garmentDataUrl } from './garments.js';
 import { OCCASIONS, DRESS_CODES, DRESS_LABELS, targetFromText, generateOutfits, swapAlternatives, capsulePlan, ACTIVITIES, scoreOutfit, computePrefs } from './stylist.js';
@@ -503,6 +503,14 @@ function renderSyncCard() {
         </div>
       </div>
       <div class="card" style="max-width:640px;margin-top:20px">
+        <h3>Notifications</h3>
+        <p class="muted" style="margin:8px 0 12px">Get a buzz when someone rates your look or styles an outfit for you. On iPhone this needs the app added to the Home Screen.</p>
+        <div style="display:flex;gap:10px;flex-wrap:wrap;align-items:center">
+          <button class="btn line" id="push-on">Turn on notifications</button>
+          <span class="muted" id="push-status" style="font-size:12.5px"></span>
+        </div>
+      </div>
+      <div class="card" style="max-width:640px;margin-top:20px">
         <h3>Let someone style you</h3>
         <p class="muted" style="margin:8px 0 12px">Send a private link to your wife, a friend, or a stylist. They see your closet (view only) and send you outfits — you'll find them under "Picked for you" in the Stylist tab. Making a new link turns off the old one.</p>
         <div style="display:flex;gap:10px;flex-wrap:wrap;align-items:center">
@@ -513,6 +521,21 @@ function renderSyncCard() {
     document.getElementById('sync-push').addEventListener('click', async () => { await pushNow(); toast('Synced'); });
     document.getElementById('sync-off').addEventListener('click', async () => {
       S.syncCode = null; await setSetting('syncCode', null); renderSyncCard();
+    });
+    pushStatus().then(st => {
+      const label = document.getElementById('push-status');
+      const btn = document.getElementById('push-on');
+      if (!label || !btn) return;
+      if (st === 'on') { label.textContent = 'On for this device ✓'; btn.style.display = 'none'; }
+      else if (st === 'denied') label.textContent = 'Blocked in browser settings — allow notifications for this site to use it.';
+      else if (st === 'unsupported') label.textContent = 'Not supported here — on iPhone, add the app to your Home Screen first.';
+    });
+    document.getElementById('push-on').addEventListener('click', async () => {
+      const r = await subscribePush(S.syncCode);
+      if (r.ok) { toast('Notifications on for this device'); renderSyncCard(); }
+      else if (r.error === 'denied') toast('Notifications were declined.');
+      else if (r.error === 'unsupported') toast('Not supported in this browser — on iPhone, install the app to the Home Screen first.');
+      else toast(r.error);
     });
     document.getElementById('share-make').addEventListener('click', async () => {
       await pushNow(); // make sure the cloud copy is current before sharing
@@ -610,7 +633,8 @@ async function renderMorningCard() {
     const days = await forecast(S.homeCity.lat, S.homeCity.lon, 2);
     const d = days[1] || days[0];
     const w = describeWmo(d.code);
-    const outfits = generateOutfits(S.items, { target: 2.5, temp: d.tMax, wears: S.wears, count: 1, prefs: S.prefs });
+    S._weather = { low: d.tMin, high: d.tMax }; // reused by the Stylist tab
+    const outfits = generateOutfits(S.items, { target: 2.5, temp: d.tMin, tempHigh: d.tMax, wears: S.wears, count: 1, prefs: S.prefs });
     if (!outfits.length) {
       box.innerHTML = `<div class="card" style="max-width:640px"><h3>Tomorrow</h3><p class="muted" style="margin-top:6px">${w.icon} ${w.text}, ${d.tMin}–${d.tMax}° in ${esc(S.homeCity.name)}. Add a top, bottom and shoes to get a morning outfit here.</p></div>`;
       return;
@@ -1449,7 +1473,7 @@ function runStylist() {
   const st = S.stylist;
   st.title = st.text.trim() || st.chip || 'Styled for you';
   st.shown = new Set();
-  st.results = generateOutfits(S.items, { target: stylistTarget(), wears: S.wears, count: 3, prefs: S.prefs });
+  st.results = generateOutfits(S.items, { target: stylistTarget(), wears: S.wears, count: 3, prefs: S.prefs, temp: S._weather?.low, tempHigh: S._weather?.high });
   st.results.forEach(o => st.shown.add(o.key));
   renderOutfits();
   if (!st.results.length) toast('Not enough items — you need a top, bottom and shoes (or a dress and shoes).');
@@ -1475,7 +1499,7 @@ function renderOutfits() {
   }));
   box.querySelectorAll('[data-shuffle]').forEach(b => b.addEventListener('click', () => {
     const idx = +b.dataset.shuffle;
-    const fresh = generateOutfits(S.items, { target: stylistTarget(), wears: S.wears, count: 1, exclude: st.shown, prefs: S.prefs });
+    const fresh = generateOutfits(S.items, { target: stylistTarget(), wears: S.wears, count: 1, exclude: st.shown, prefs: S.prefs, temp: S._weather?.low, tempHigh: S._weather?.high });
     if (!fresh.length) { toast('That was everything your closet can make for this occasion.'); return; }
     st.results[idx] = fresh[0];
     st.shown.add(fresh[0].key);
@@ -1835,10 +1859,10 @@ function ratingsHtml(w) {
   return look.ratings.map(r => {
     const itemNotes = [];
     for (const [id, v] of Object.entries(r.items || {})) {
-      if (v === 'no') {
-        const it = look.items.find(x => x.id === id);
-        if (it) itemNotes.push(`✕ ${it.name}${(r.tags && r.tags[id] || []).length ? ` (${r.tags[id].join(', ')})` : ''}`);
-      }
+      const it = look.items.find(x => x.id === id);
+      if (!it) continue;
+      if (v === 'no') itemNotes.push(`✕ ${it.name}${(r.tags && r.tags[id] || []).length ? ` (${r.tags[id].join(', ')})` : ''}`);
+      else if (v === 'love') itemNotes.push(`❤️ ${it.name}`);
     }
     for (const [id, ts] of Object.entries(r.tags || {})) {
       if ((r.items || {})[id] !== 'no') {
@@ -1910,6 +1934,7 @@ function viewPack() {
     <div id="pk-result" style="margin-top:28px"></div>`;
   document.getElementById('pk-go').addEventListener('click', runPack);
   if (S.pack.result) renderPackResult();
+  else restorePack().then(r => { if (r && !S.pack.result) { S.pack.result = r; S.pack.form = { ...S.pack.form, ...r.form }; renderPackResult(); } });
 }
 
 async function runPack() {
@@ -1957,9 +1982,37 @@ async function runPack() {
 
   S.pack.result = {
     ...capsulePlan(S.items, { days: f.days, occasions: occs, temps, rainDays, activities, themes, effDays, itemCap }),
-    weather, weatherNote, form: { ...f }, effDays, itemCap,
+    weather, weatherNote, form: { ...f }, effDays, itemCap, checked: [],
   };
+  await savePack();
   renderPackResult();
+}
+
+// packs survive leaving the page — capsule items stored by id, checklist by label
+async function savePack() {
+  const r = S.pack.result;
+  if (!r) return;
+  await setSetting('lastPack', {
+    ...r,
+    capsule: r.capsule.map(i => i.id),
+    outfitCount: r.outfits.length,
+    outfits: [], // recomputable, heavy
+    plan: r.plan.map(p => ({ ...p, outfit: p.outfit ? { items: p.outfit.items.map(i => i.id) } : null })),
+  });
+}
+
+async function restorePack() {
+  const saved = await getSetting('lastPack');
+  if (!saved) return null;
+  const byId = id => S.items.find(i => i.id === id);
+  const capsule = saved.capsule.map(byId).filter(Boolean);
+  if (!capsule.length) return null;
+  return {
+    ...saved,
+    capsule,
+    plan: saved.plan.map(p => ({ ...p, outfit: p.outfit ? { items: p.outfit.items.map(byId).filter(Boolean) } : null })),
+    outfits: { length: saved.outfitCount ?? '' },
+  };
 }
 
 function renderPackResult() {
@@ -1993,11 +2046,19 @@ function renderPackResult() {
         ${p.outfit ? `<span class="mini">${p.outfit.items.map(i => `<img src="${itemImg(i)}" title="${esc(i.name)}" alt="">`).join('')}</span><span style="font-size:12.5px" class="muted">${p.outfit.items.map(i => esc(i.name)).join(' + ')}</span>` : '<span class="muted">no matching outfit — see gaps</span>'}
       </div>`).join('')}</div>
     <h3 style="margin-top:26px">Pack against this</h3>
-    <div class="checklist">
-      ${Object.entries(byCat).map(([cat, arr]) => arr.map(i => `<label><input type="checkbox"> ${esc(i.name)} <span class="muted" style="font-size:12px">(${catLabel(cat).toLowerCase()})</span></label>`).join('')).join('')}
-      <label><input type="checkbox"> Underwear &amp; socks × ${(r.effDays || f.days) + 1}${r.effDays ? ' (laundry covers the rest)' : ''}</label>
-      <label><input type="checkbox"> Toiletries${r.effDays ? ' + travel detergent' : ''}</label>
+    <div class="checklist" id="pk-checklist">
+      ${Object.entries(byCat).map(([cat, arr]) => arr.map(i => `<label><input type="checkbox" data-pk-chk="${esc(i.name)}" ${(r.checked || []).includes(i.name) ? 'checked' : ''}> ${esc(i.name)} <span class="muted" style="font-size:12px">(${catLabel(cat).toLowerCase()})</span></label>`).join('')).join('')}
+      <label><input type="checkbox" data-pk-chk="__underwear" ${(r.checked || []).includes('__underwear') ? 'checked' : ''}> Underwear &amp; socks × ${(r.effDays || f.days) + 1}${r.effDays ? ' (laundry covers the rest)' : ''}</label>
+      <label><input type="checkbox" data-pk-chk="__toiletries" ${(r.checked || []).includes('__toiletries') ? 'checked' : ''}> Toiletries${r.effDays ? ' + travel detergent' : ''}</label>
     </div>`;
+  document.getElementById('pk-checklist').addEventListener('change', e => {
+    const cb = e.target.closest('[data-pk-chk]');
+    if (!cb) return;
+    r.checked = r.checked || [];
+    if (cb.checked) { if (!r.checked.includes(cb.dataset.pkChk)) r.checked.push(cb.dataset.pkChk); }
+    else r.checked = r.checked.filter(x => x !== cb.dataset.pkChk);
+    savePack();
+  });
 }
 
 // ---------- boot ----------
@@ -2011,6 +2072,12 @@ async function boot() {
   render();
   if (S.syncCode) { pullOnBoot(); refreshPrefs(); }
   else S.prefs = computePrefs([], S.wears);
+  // today's weather quietly powers heat-aware suggestions everywhere
+  if (S.homeCity && !S._weather) {
+    forecast(S.homeCity.lat, S.homeCity.lon, 1)
+      .then(days => { if (days[0]) S._weather = { low: days[0].tMin, high: days[0].tMax }; })
+      .catch(() => {});
+  }
 }
 boot();
 

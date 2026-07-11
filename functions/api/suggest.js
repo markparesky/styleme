@@ -1,5 +1,7 @@
 // Stylist submits an outfit suggestion by share token.
 // POST { token, outfit: { itemIds: [], note, from } } → { ok }
+import { notifyOwner } from './_push.js';
+
 function json(obj, status = 200) {
   return new Response(JSON.stringify(obj), {
     status,
@@ -7,7 +9,8 @@ function json(obj, status = 200) {
   });
 }
 
-export async function onRequestPost({ request, env }) {
+export async function onRequestPost(context) {
+  const { request, env } = context;
   if (!env.STYLEME_KV) return json({ error: 'Sync is not set up on the server yet.' }, 501);
   let body;
   try { body = await request.json(); } catch { return json({ error: 'Bad request.' }, 400); }
@@ -28,5 +31,10 @@ export async function onRequestPost({ request, env }) {
     at: Date.now(),
   });
   await env.STYLEME_KV.put(key, JSON.stringify(list.slice(0, 50)));
+  context.waitUntil(notifyOwner(env, closetId, {
+    title: 'Picked for you',
+    body: `${list[0].from} styled an outfit for you${list[0].note ? ` — “${list[0].note.slice(0, 80)}”` : ''}`,
+    url: '/#/stylist',
+  }));
   return json({ ok: true });
 }

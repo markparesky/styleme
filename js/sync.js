@@ -57,6 +57,38 @@ export async function dismissSuggestion(code, removeId) {
   await fetch('/api/suggestions', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ id, removeId }) }).catch(() => {});
 }
 
+// ---- push notifications ----
+export async function subscribePush(code) {
+  if (!('serviceWorker' in navigator) || !('PushManager' in window)) {
+    return { error: 'unsupported' };
+  }
+  const perm = await Notification.requestPermission();
+  if (perm !== 'granted') return { error: 'denied' };
+  const reg = await navigator.serviceWorker.ready;
+  const keyRes = await fetch('/api/push');
+  if (!keyRes.ok) return { error: 'Server not ready for notifications yet.' };
+  const { publicKey } = await keyRes.json();
+  const pad = publicKey.replace(/-/g, '+').replace(/_/g, '/') + '==='.slice((publicKey.length + 3) % 4);
+  const appKey = Uint8Array.from(atob(pad), c => c.charCodeAt(0));
+  const sub = await reg.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: appKey });
+  const id = await codeToId(code);
+  const res = await fetch('/api/push', {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ id, subscription: sub.toJSON() }),
+  });
+  return res.ok ? { ok: true } : { error: 'Could not register this device.' };
+}
+
+export async function pushStatus() {
+  if (!('serviceWorker' in navigator) || !('PushManager' in window)) return 'unsupported';
+  if (Notification.permission === 'denied') return 'denied';
+  try {
+    const reg = await navigator.serviceWorker.ready;
+    const sub = await reg.pushManager.getSubscription();
+    return sub ? 'on' : 'off';
+  } catch { return 'off'; }
+}
+
 // ---- posted looks & ratings ----
 export async function postLook(code, look) {
   const id = await codeToId(code);

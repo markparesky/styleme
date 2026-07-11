@@ -87,8 +87,12 @@ export function computePrefs(looks = [], wears = []) {
 
 const clamp = (n, lim) => Math.max(-lim, Math.min(lim, n));
 
+// Fabric/weight heuristics from item names — no per-item warmth data needed
+const HEAVY_RE = /jean|denim|flannel|wool|sweater|hoodie|corduroy|leather|fleece|cashmere|quilt|down|parka|puffer/i;
+const BREEZY_RE = /short|linen|tank|swim|mesh|seersucker|sleeveless/i;
+
 // Score a set of items as one outfit. Returns { score, why, palette }
-export function scoreOutfit(items, target, recentPairs, prefs = null) {
+export function scoreOutfit(items, target, recentPairs, prefs = null, weather = null) {
   const ms = items.map(meta);
   let score = 50;
   const why = [];
@@ -169,6 +173,25 @@ export function scoreOutfit(items, target, recentPairs, prefs = null) {
     why.push(`You wore this exact combination recently — swapped scoring against a repeat.`);
   }
 
+  // ---- weather sanity: no jeans and an overshirt on a 90° day ----
+  if (weather && weather.high != null) {
+    if (weather.high >= 78) {
+      let sweat = 0;
+      const offenders = [];
+      for (const i of items) {
+        if (i.category === 'layer') { sweat += 14; offenders.push(i.name); }
+        else if (HEAVY_RE.test(i.name)) { sweat += 7; offenders.push(i.name); }
+        if (BREEZY_RE.test(i.name)) sweat -= 6;
+      }
+      score -= Math.max(0, sweat);
+      if (sweat >= 14) why.push(`At ${weather.high}° the ${offenders[0].toLowerCase()} will cook you — something lighter wins the day.`);
+      else if (sweat <= -6) why.push(`Light fabrics for a ${weather.high}° day.`);
+    }
+    if (weather.low != null && weather.low <= 45) {
+      for (const i of items) if (BREEZY_RE.test(i.name)) { score -= 10; why.push(`${i.name} at ${weather.low}° is brave, not stylish.`); break; }
+    }
+  }
+
   // ---- learned taste: your hearts, your people's verdicts, the AI's review ----
   if (prefs) {
     let learned = 0;
@@ -184,20 +207,30 @@ export function scoreOutfit(items, target, recentPairs, prefs = null) {
   return { score, why, palette: ms };
 }
 
-function* combos(byCat, temp) {
+function* combos(byCat, weather) {
   const layers = byCat.layer || [];
-  const needLayer = temp != null && temp < 62;
-  const layerOpts = layers.length ? (needLayer ? layers.map(l => [l]) : [[], ...layers.map(l => [l])]) : [[]];
+  const low = weather && weather.low;
+  const high = weather && weather.high;
+  const needLayer = low != null && low < 62;
+  const noLayer = high != null && high >= 78; // heat beats habit
+  const layerOpts = layers.length && !noLayer
+    ? (needLayer ? layers.map(l => [l]) : [[], ...layers.map(l => [l])])
+    : [[]];
+  const accOpts = [[], ...(byCat.accessory || []).map(a => [a])];
   for (const top of byCat.top || []) {
     for (const bottom of byCat.bottom || []) {
       for (const shoes of byCat.shoes || []) {
-        for (const layer of layerOpts) yield [top, bottom, shoes, ...layer];
+        for (const layer of layerOpts) {
+          for (const acc of accOpts) yield [top, bottom, shoes, ...layer, ...acc];
+        }
       }
     }
   }
   for (const dress of byCat.dress || []) {
     for (const shoes of byCat.shoes || []) {
-      for (const layer of layerOpts) yield [dress, shoes, ...layer];
+      for (const layer of layerOpts) {
+        for (const acc of accOpts) yield [dress, shoes, ...layer, ...acc];
+      }
     }
   }
 }
@@ -213,17 +246,18 @@ export function recentPairKeys(wears, days = 14) {
   return set;
 }
 
-export function generateOutfits(items, { target = 3, temp = null, wears = [], count = 3, exclude = new Set(), buildAroundId = null, prefs = null } = {}) {
+export function generateOutfits(items, { target = 3, temp = null, tempHigh = null, wears = [], count = 3, exclude = new Set(), buildAroundId = null, prefs = null } = {}) {
   const avail = items.filter(i => !i.laundry);
   const byCat = {};
   for (const i of avail) (byCat[i.category] = byCat[i.category] || []).push(i);
   const recent = recentPairKeys(wears);
+  const weather = (temp != null || tempHigh != null) ? { low: temp, high: tempHigh != null ? tempHigh : temp } : null;
   const scored = [];
-  for (const combo of combos(byCat, temp)) {
+  for (const combo of combos(byCat, weather)) {
     if (buildAroundId && !combo.some(i => i.id === buildAroundId)) continue;
     const key = combo.map(i => i.id).sort().join('|');
     if (exclude.has(key)) continue;
-    const s = scoreOutfit(combo, target, recent, prefs);
+    const s = scoreOutfit(combo, target, recent, prefs, weather);
     scored.push({ items: combo, key, ...s });
   }
   scored.sort((a, b) => b.score - a.score);
@@ -327,12 +361,13 @@ export function capsulePlan(items, { days, occasions, temps = [], rainDays = [],
   const targets = occasions.map(o => o.target);
   const uniqueTargets = [...new Set(targets)];
   const coldest = temps.length ? Math.min(...temps) : null;
+  const hottest = temps.length ? Math.max(...temps) : null;
 
   // start: for each unique target, the best outfit
   const chosen = new Map();
   const outfitList = [];
   for (const t of uniqueTargets) {
-    const best = generateOutfits(avail, { target: t, temp: coldest, count: 2 });
+    const best = generateOutfits(avail, { target: t, temp: coldest, tempHigh: hottest, count: 2 });
     for (const o of best) {
       outfitList.push({ ...o, target: t });
       o.items.forEach(i => chosen.set(i.id, i));
@@ -351,7 +386,7 @@ export function capsulePlan(items, { days, occasions, temps = [], rainDays = [],
       const trial = [...chosen.values(), cand];
       let gained = 0;
       for (const t of uniqueTargets) {
-        gained += generateOutfits(trial, { target: t, temp: coldest, count: 6 })
+        gained += generateOutfits(trial, { target: t, temp: coldest, tempHigh: hottest, count: 6 })
           .filter(o => o.items.includes(cand) && o.score > 40).length;
       }
       if (!bestAdd || gained > bestAdd.gained) bestAdd = { cand, gained };
@@ -359,7 +394,7 @@ export function capsulePlan(items, { days, occasions, temps = [], rainDays = [],
     if (!bestAdd || bestAdd.gained === 0) break;
     chosen.set(bestAdd.cand.id, bestAdd.cand);
     for (const t of uniqueTargets) {
-      for (const o of generateOutfits([...chosen.values()], { target: t, temp: coldest, count: 6 })) {
+      for (const o of generateOutfits([...chosen.values()], { target: t, temp: coldest, tempHigh: hottest, count: 6 })) {
         if (!outfitList.some(x => x.key === o.key) && o.score > 40) outfitList.push({ ...o, target: t });
       }
     }
