@@ -17,19 +17,17 @@ const b64u = {
 
 export async function getVapid(env) {
   let stored = null;
-  try { stored = JSON.parse((await env.STYLEME_KV.get('vapid')) || 'null'); } catch { /* regenerate */ }
-  if (!stored) {
-    const pair = await crypto.subtle.generateKey({ name: 'ECDSA', namedCurve: 'P-256' }, true, ['sign']);
+  try { stored = JSON.parse((await env.STYLEME_KV.get('vapid2')) || 'null'); } catch { /* regenerate */ }
+  if (!stored || !stored.publicRaw || !stored.privateJwk) {
+    const pair = await crypto.subtle.generateKey({ name: 'ECDSA', namedCurve: 'P-256' }, true, ['sign', 'verify']);
     stored = {
-      publicJwk: await crypto.subtle.exportKey('jwk', pair.publicKey),
+      publicRaw: b64u.encode(await crypto.subtle.exportKey('raw', pair.publicKey)),
       privateJwk: await crypto.subtle.exportKey('jwk', pair.privateKey),
     };
-    await env.STYLEME_KV.put('vapid', JSON.stringify(stored));
+    await env.STYLEME_KV.put('vapid2', JSON.stringify(stored));
   }
-  const publicKey = await crypto.subtle.importKey('jwk', stored.publicJwk, { name: 'ECDSA', namedCurve: 'P-256' }, true, ['verify']);
   const privateKey = await crypto.subtle.importKey('jwk', stored.privateJwk, { name: 'ECDSA', namedCurve: 'P-256' }, false, ['sign']);
-  const publicRaw = await crypto.subtle.exportKey('raw', publicKey);
-  return { privateKey, publicRaw, publicB64u: b64u.encode(publicRaw) };
+  return { privateKey, publicB64u: stored.publicRaw };
 }
 
 async function vapidAuthHeader(vapid, endpoint) {
